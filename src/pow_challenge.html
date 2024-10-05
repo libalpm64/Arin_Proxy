@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arin Proxy</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.0.0/crypto-js.min.js"></script>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #000000;
+            color: #ffffff;
+        }
+        .container {
+            background-color: rgba(255, 255, 255, 0.05);
+            padding: 2rem;
+            border-radius: 15px;
+            box-shadow: 0 8px 32px 0 rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            text-align: center;
+            max-width: 400px;
+            width: 100%;
+        }
+        h1 {
+            margin-bottom: 1rem;
+            font-size: 1.8rem;
+        }
+        #status {
+            margin-top: 1rem;
+        }
+        #progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 1rem;
+        }
+        #progress {
+            width: 0%;
+            height: 100%;
+            background-color: #3498db;
+            transition: width 0.5s ease-in-out;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Arin Proxy</h1>
+        <p>Challenge</p>
+        <div id="progress-bar"><div id="progress"></div></div>
+        <p id="status">Verifying your browser...</p>
+    </div>
+
+    <script>
+        const publicSalt = "{public_salt}";
+        const difficulty = {difficulty};
+        const workerCount = navigator.hardwareConcurrency || 4;
+        const statusElement = document.getElementById('status');
+        const progressElement = document.getElementById('progress');
+        let solvedPrivateSalt = null;
+
+        const workerCode = `
+            self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.0.0/crypto-js.min.js');
+            self.onmessage = function(e) {
+                const { publicSalt, difficulty, startSalt, increment } = e.data;
+                let privateSalt = startSalt;
+                while (true) {
+                    const hash = CryptoJS.SHA256(publicSalt + privateSalt).toString();
+                    if (hash.startsWith("0".repeat(difficulty))) {
+                        self.postMessage({ type: 'solved', privateSalt: privateSalt.toString() });
+                        return;
+                    }
+                    privateSalt += increment;
+                }
+            };
+        `;
+
+        const workers = Array.from({ length: workerCount }, (_, i) => {
+            const worker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' })));
+            worker.postMessage({ publicSalt, difficulty, startSalt: i, increment: workerCount });
+            return worker;
+        });
+
+        workers.forEach(worker => {
+            worker.onmessage = async function(e) {
+                if (e.data.type === 'solved' && !solvedPrivateSalt) {
+                    solvedPrivateSalt = e.data.privateSalt;
+                    workers.forEach(w => w.terminate());
+                    await verifyChallenge(solvedPrivateSalt);
+                }
+            };
+        });
+
+        async function verifyChallenge(privateSalt) {
+            statusElement.textContent = 'Verifying...';
+            progressElement.style.width = '100%';
+
+            try {
+                const response = await fetch('/pow/validate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ private_salt: privateSalt, public_salt: publicSalt })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.verified) {
+                    statusElement.textContent = 'Verification successful. Redirecting...';
+                    setTimeout(() => window.location.reload(), 2000);
+                } else {
+                    statusElement.textContent = 'Verification failed. Please try again.';
+                }
+            } catch (error) {
+                console.error('Verification error:', error);
+                statusElement.textContent = 'An error occurred. Please try again.';
+            }
+        }
+        let progress = 0;
+        const progressInterval = setInterval(() => {
+            if (progress < 90 && !solvedPrivateSalt) {
+                progress += Math.random() * 5;
+                progressElement.style.width = `${progress}%`;
+            } else if (solvedPrivateSalt) {
+                clearInterval(progressInterval);
+                progressElement.style.width = '100%';
+            }
+        }, 200);
+    </script>
+</body>
+</html>

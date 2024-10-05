@@ -1,0 +1,15 @@
+{
+  "domains": {
+    "example.org": {
+      "backend": "127.0.0.1:8000",
+      "cloudflare_mode": true,
+      "stage": 1
+    },
+    "example.arinproxy": {
+      "backend": "127.0.0.1:8000",
+      "cloudflare_mode": true,
+      "stage": 1
+    }
+  },
+  "cookie_secret": "YourSecretHere"
+}
