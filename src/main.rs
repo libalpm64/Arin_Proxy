@@ -127,10 +127,7 @@ async fn handle_request(
 
     let cookie_valid = verify_challenge_cookie(cookie_str, &ip, current_time, &state.cookie_secret);
 
-    let mut current_stage = 0;
-    let mut backend = String::new();
-
-    if let Some(mut domain_settings) = state.domains.get_mut(domain) {
+    let (current_stage, backend) = if let Some(mut domain_settings) = state.domains.get_mut(domain) {
         domain_settings.total_requests += 1;
 
         if domain_settings
@@ -143,14 +140,13 @@ async fn handle_request(
             domain_settings.bypassed_requests = 0;
             domain_settings.last_reset = Some(Instant::now());
         }
-
-        current_stage = domain_settings.current_stage;
-        backend = domain_settings.backend.clone();
-
         if cookie_valid {
             domain_settings.bypassed_requests += 1;
         }
-    }
+        (domain_settings.current_stage, domain_settings.backend.clone())
+    } else {
+        (0, String::new())
+    };
 
     if !cookie_valid {
         match current_stage {
@@ -315,7 +311,7 @@ fn generate_public_salt() -> String {
         .collect()
 }
 
-// This is beta it's not very good. 
+// This is beta it's not very good.
 fn generate_pow_html(public_salt: &str, difficulty: u64) -> String {
     let html = include_str!("pow_challenge.html");
     html.replace("{public_salt}", public_salt)
@@ -331,12 +327,12 @@ fn hash_ip_with_timestamp(ip: &str, timestamp: u64, secret: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Task Scheduler for backlog of IP addresses. (Added this due to the connection pool getitng to big). 
+/// Task Scheduler for cleaning up stale IP entries.
 async fn cleanup_stale_ip_requests(state: Arc<AppState>) {
     loop {
         sleep(Duration::from_secs(60)).await;
         let now = Instant::now();
-        // Remove any IP for the queue that has an entry whose last seen timestamp is older than IP_ENTRY_STALE_DURATION
+        // Remove any IP whose last seen timestamp is older than IP_ENTRY_STALE_DURATION.
         let stale_ips: Vec<String> = state
             .ip_requests
             .iter()
@@ -359,12 +355,9 @@ async fn cleanup_stale_ip_requests(state: Arc<AppState>) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let client = Client::builder()
-        // TCP KeepAlive: If you're running a file uploading service please modify this in your worker pass until the file is uploading (basically you would need to call a function to delay this for this paticular request).
-        // Pool Idle timeout: Adjust it this is paticular useful depending on how large you want your pools to be of requests before it adds new queue. 
-        // Timeout: Only change this if you have some specific use to doing this. 
-        .pool_idle_timeout(Some(Duration::from_secs(60))) 
-        .tcp_keepalive(Some(Duration::from_secs(75))) 
-        .timeout(Duration::from_secs(30)) 
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .tcp_keepalive(Some(Duration::from_secs(75)))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to build reqwest client");
 
@@ -390,9 +383,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(client.clone()))
             .default_service(web::to(handle_request))
     })
-    .keep_alive(Duration::from_secs(75))     // Server keep-alive setting.
-    .client_request_timeout(Duration::from_secs(30))  // Request timeout.
-    .client_disconnect_timeout(5) // Shutdown timeout.
+    .keep_alive(Duration::from_secs(75))                  // Server keep-alive setting.
+    .client_request_timeout(Duration::from_secs(30))       // Request timeout.
+    .client_disconnect_timeout(Duration::from_secs(5))     // Disconnect timeout.
     .bind("127.0.0.1:3000")?
     .run()
     .await
