@@ -342,7 +342,7 @@ async fn cleanup_stale_ip_requests(state: Arc<AppState>) {
             .iter()
             .filter_map(|entry| {
                 let (_, last_seen) = *entry.value();
-                if now.duration_since(*last_seen).as_secs() > IP_ENTRY_STALE_DURATION {
+                if now.duration_since(last_seen).as_secs() > IP_ENTRY_STALE_DURATION {
                     Some(entry.key().clone())
                 } else {
                     None
@@ -391,8 +391,8 @@ async fn main() -> std::io::Result<()> {
             .default_service(web::to(handle_request))
     })
     .keep_alive(Duration::from_secs(75))     // Server keep-alive setting.
-    .client_timeout(Duration::from_secs(30))   // Request timeout.
-    .client_shutdown(Duration::from_secs(5))   // Shutdown timeout.
+    .client_request_timeout(Duration::from_secs(30))  // Request timeout.
+    .client_disconnect_timeout(5) // Shutdown timeout.
     .bind("127.0.0.1:3000")?
     .run()
     .await
