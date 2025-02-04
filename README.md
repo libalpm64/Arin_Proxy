@@ -27,4 +27,4 @@ Arin Proxy operates through three distinct stages:
 
 ## Licensing Requirements
 
-To maintain integrity, please include the word "Arin" anywhere on your site or in your code if you use or have built on top of it. (It doesn't have to be visible). This is apart of the MIT License.
+We have removed the license requirement to include Arin.
