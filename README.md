@@ -1,4 +1,5 @@
 # Arin Proxy
+<img src="https://tokei.rs/b1/github/libalpm64/Arin_Proxy?category=code&style=flat" alt="Lines of Code"/>
 
 Arin Proxy is a DDoS-protected reverse proxy designed to run behind CDNs like Cloudflare. It helps prevent bypass attempts that could overwhelm your application. Built using the Actix Web framework, Arin Proxy is both fast and feature-rich and optimized for high performance with various challenges to mitigate HTTP/HTTPS DDoS attacks without taxing the client's backend server.
 
