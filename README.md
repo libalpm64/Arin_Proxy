@@ -33,6 +33,7 @@ Arin Proxy operates through three distinct stages:
 
 **Optimizations:**  
 I’ve taken optimizations to the absolute extreme—using the best-fit CPU instructions and SIMD wherever possible. This is as fast as it can get, down to the flag level. The *only* overhead comes from Tokio, Actix, and Rust’s std library. I’ve avoided most hot paths introduced by these runtimes, and the critical logic runs on the stack with strong cache coherence. Here’s the control flow graph / branch layout that LLVM generated (it primarily uses SSE instructions—LLVM loves SSE because they’re great for floats).
+
 <img width="1023" height="622" alt="image" src="https://github.com/user-attachments/assets/5eb885b9-1904-4797-851b-f1c6253e30df" />
 
 **Atomic Data Storage:**  
@@ -46,4 +47,5 @@ Our PoW challenge is only **2 KB**, which is way smaller than most other service
 
 The other challenge stages (cookie + JS) are only a few bytes and require almost no effort—they’re completely invisible to the client. Users won’t even notice these checks are running.
 
+## License
 We have an MIT License; we are not liable or provide any warranty for this software. Please do your own due diligence if you are going to use this in production.
