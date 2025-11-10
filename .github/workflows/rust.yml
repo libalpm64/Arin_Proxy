@@ -9,19 +9,14 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
       - name: Build release binary
         run: cargo build --release --verbose
-
       - name: Run tests
         run: cargo test --verbose
-
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -31,9 +26,25 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
+      - name: Create tag for release
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="auto-${{ github.run_number }}"
+          git fetch --tags --force
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Auto tag for release $TAG"
+            git push origin "$TAG"
+          else
+            echo "Tag $TAG already exists"
+          fi
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
