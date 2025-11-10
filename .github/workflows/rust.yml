@@ -25,8 +25,8 @@ jobs:
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Arin_Proxy
-          path: target/release/Arin_Proxy
+          name: Arin
+          path: target/release/Arin-Proxy
 
   release:
     needs: build
@@ -38,7 +38,8 @@ jobs:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: Arin_Proxy
+          name: Arin
+          path: .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -46,6 +47,6 @@ jobs:
           tag_name: auto-${{ github.run_number }}
           name: "Auto Release ${{ github.run_number }}"
           body: "Automated release from main branch build."
-          files: Arin_Proxy
+          files: Arin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
