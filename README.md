@@ -26,8 +26,7 @@ Arin Proxy operates through three distinct stages:
 - **Use a Multi-core Server:** Arin Proxy is asynchronous, allowing for multi-threading. More cores will enhance performance.
 - **High Bandwidth Server:** For the PoW challenge, a server with high port-speed (10+ Gbps) is recommended to manage the increased data transmission, as each visitor request generates a large response.
 - **Check your CPU for instruction sets:** Most server hardware supports AVX2 but AVX2 is the recommendation to check do ```lscpu``` and find the flag AVX.
-- **Don't know where to find a server:** Hetzner is probally your best bet (not sponsored, I wish, EU locations) for US 
-## Licensing Requirements
+- **Don't know where to find a server:** Hetzner is probally your best bet (not sponsored, I wish, EU locations) for US
 
 ## For Technical Users
 
