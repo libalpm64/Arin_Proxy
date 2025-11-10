@@ -1,392 +1,209 @@
+mod config;
+mod state;
+mod pow;
+mod handlers;
+mod blake3;
+
 use std::collections::HashMap;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufReader;
+use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse, Error};
-use actix_web::cookie::Cookie;
-use blake3;
+use actix_web::{web, App, HttpServer};
 use dashmap::DashMap;
-use lazy_static::lazy_static;
-use rand::Rng;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tokio::time::sleep;
+use actix_web::rt::time::interval;
+use mimalloc::MiMalloc;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
 
-#[derive(Clone, Serialize, Deserialize)]
-struct DomainSettings {
-    backend: String,
-    cloudflare_mode: bool,
-    #[serde(default)]
-    stage: Option<u8>,
-    #[serde(skip)]
-    total_requests: u64,
-    #[serde(skip)]
-    bypassed_requests: u64,
-    #[serde(skip)]
-    last_reset: Option<Instant>,
-    #[serde(skip)]
-    current_stage: u8,
-}
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+use log::{info, error};
 
-lazy_static! {
-    static ref STATE: Arc<AppState> = {
-        let config: Config = serde_json::from_reader(BufReader::new(File::open("config.json").unwrap()))
-            .expect("Invalid config.json");
-
-        let domains: DashMap<String, DomainSettings> = config.domains.into_iter().map(|(k, mut v)| {
-            v.current_stage = v.stage.unwrap_or(0);
-            v.last_reset = Some(Instant::now());
-            (k, v)
-        }).collect();
-
-        Arc::new(AppState {
-            domains,
-            ip_requests: DashMap::new(),
-            cookie_secret: config.cookie_secret.into_bytes(),
-        })
-    };
-}
-
-#[derive(Serialize, Deserialize)]
-struct Config {
-    domains: HashMap<String, DomainSettings>,
-    cookie_secret: String,
-}
-
-#[derive(Deserialize)]
-struct PowValidationRequest {
-    private_salt: String,
-    public_salt: String,
-}
-
-#[derive(Serialize)]
-struct PowValidationResponse {
-    verified: bool,
-}
-
-struct AppState {
-    domains: DashMap<String, DomainSettings>,
-    ip_requests: DashMap<String, (u64, Instant)>,
-    cookie_secret: Vec<u8>,
-}
-
-const STAGE_THRESHOLD: u64 = 500;
-const COOKIE_VALIDITY_DURATION: u64 = 3600;
-const POW_DIFFICULTY: u64 = 6;
-const IP_ENTRY_STALE_DURATION: u64 = 60;
-
-async fn handle_request(
-    req: HttpRequest,
-    body: web::Bytes,
-    state: web::Data<Arc<AppState>>,
-    client: web::Data<Client>,
-) -> Result<HttpResponse, Error> {
-    let domain = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Invalid domain"))?;
-    
-    if req.method() == actix_web::http::Method::POST && req.path() == "/pow/validate" {
-        return validate_pow(req, body, state, client).await;
-    }
-
-    let ip = if state.domains.get(domain).map(|d| d.cloudflare_mode).unwrap_or(false) {
-        req.headers()
-            .get("CF-Connecting-IP")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        req.connection_info().realip_remote_addr().unwrap_or("").to_string()
-    };
-
-    {
-        let mut ip_entry = state.ip_requests.entry(ip.clone()).or_insert((0, Instant::now()));
-        let (count, last_reset) = &mut *ip_entry;
-        if last_reset.elapsed() > Duration::from_secs(IP_ENTRY_STALE_DURATION) {
-            *count = 1;
-            *last_reset = Instant::now();
-        } else {
-            *count += 1;
-        }
-    }
-
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
-
-    let cookie_str = req
-        .headers()
-        .get("cookie")
-        .and_then(|c| c.to_str().ok())
-        .unwrap_or("");
-
-    let cookie_valid = verify_challenge_cookie(cookie_str, &ip, current_time, &state.cookie_secret);
-
-    let (current_stage, backend) = if let Some(mut domain_settings) = state.domains.get_mut(domain) {
-        domain_settings.total_requests += 1;
-
-        if domain_settings
-            .last_reset
-            .map_or(true, |last_reset| last_reset.elapsed() >= Duration::from_secs(1))
-        {
-            if domain_settings.bypassed_requests >= STAGE_THRESHOLD {
-                domain_settings.current_stage = (domain_settings.current_stage + 1).min(3);
-            }
-            domain_settings.bypassed_requests = 0;
-            domain_settings.last_reset = Some(Instant::now());
-        }
-        if cookie_valid {
-            domain_settings.bypassed_requests += 1;
-        }
-        (domain_settings.current_stage, domain_settings.backend.clone())
-    } else {
-        (0, String::new())
-    };
-
-    if !cookie_valid {
-        match current_stage {
-            0 => { /* Allow request to pass */ }
-            1 => {
-                let challenge_cookie = create_challenge_cookie(&ip, current_time, &state.cookie_secret);
-                return Ok(HttpResponse::TemporaryRedirect()
-                    .insert_header(("Set-Cookie", format!("{}; SameSite=Lax", challenge_cookie)))
-                    .insert_header(("Location", req.uri().to_string()))
-                    .finish());
-            },
-            2 => {
-                let challenge_cookie = create_challenge_cookie(&ip, current_time, &state.cookie_secret);
-                let js_challenge = format!(
-                    r#"<!DOCTYPE html><html><head><script>
-                    document.cookie = '{}; SameSite=None; Secure';
-                    window.location.reload();
-                    </script></head><body></body></html>"#,
-                    challenge_cookie
-                );
-                return Ok(HttpResponse::Ok().content_type("text/html").body(js_challenge));
-            },
-            3 => {
-                let public_salt = generate_public_salt();
-                let pow_html = generate_pow_html(&public_salt, POW_DIFFICULTY);
-                return Ok(HttpResponse::Ok().content_type("text/html").body(pow_html));
-            },
-            _ => return Err(actix_web::error::ErrorForbidden("Request blocked")),
-        }
-    }
-
-    proxy_request(req, body, &backend, &client).await
-}
-
-async fn proxy_request(
-    req: HttpRequest,
-    body: web::Bytes,
-    backend: &str,
-    client: &Client,
-) -> Result<HttpResponse, Error> {
-    let original_host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    let backend_url = format!(
-        "http://{}{}",
-        backend,
-        req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("")
-    );
-    
-    let mut backend_req = client.request(req.method().clone(), &backend_url);
-
-    for (name, value) in req.headers() {
-        if name != "host" {
-            backend_req = backend_req.header(name.clone(), value.clone());
-        }
-    }
-    
-    backend_req = backend_req.header("Host", original_host);
-    let resp = backend_req
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Backend request failed: {}", e)))?;
-    
-    let mut client_resp = HttpResponse::build(resp.status());
-    for (name, value) in resp.headers() {
-        client_resp.insert_header((name.clone(), value.clone()));
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to get response body: {}", e)))?;
-    
-    Ok(client_resp.body(bytes))
-}
-
-#[inline]
-fn create_challenge_cookie(ip: &str, timestamp: u64, secret: &[u8]) -> String {
-    let cookie_value = hash_ip_with_timestamp(ip, timestamp, secret);
-    format!("Arin={}", cookie_value)
-}
-
-async fn validate_pow(
-    req: HttpRequest,
-    body: web::Bytes,
-    state: web::Data<Arc<AppState>>,
-    _client: web::Data<Client>,
-) -> Result<HttpResponse, Error> {
-    let pow_request: PowValidationRequest = serde_json::from_slice(&body)
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid POW validation request"))?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(pow_request.public_salt.as_bytes());
-    hasher.update(pow_request.private_salt.as_bytes());
-    let challenge = format!("{:x}", hasher.finalize());
-
-    let verified = challenge.starts_with(&"0".repeat(POW_DIFFICULTY as usize));
-
-    if verified {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
-        let ip = req.connection_info().realip_remote_addr().unwrap_or("").to_string();
-        let challenge_cookie = create_challenge_cookie(&ip, current_time, &state.cookie_secret);
-        
-        let mut response = HttpResponse::Ok();
-        response.cookie(
-            Cookie::build("Arin", challenge_cookie)
-                .path("/")
-                .http_only(true)
-                .same_site(actix_web::cookie::SameSite::Lax)
-                .finish()
-        );
-
-        let domain = req
-            .headers()
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .ok_or_else(|| actix_web::error::ErrorBadRequest("Invalid domain"))?;
-        let backend = state
-            .domains
-            .get(domain)
-            .map(|d| d.backend.clone())
-            .ok_or_else(|| actix_web::error::ErrorBadRequest("Invalid domain"))?;
-
-        Ok(response.json(PowValidationResponse { verified: true }))
-    } else {
-        Ok(HttpResponse::Ok().json(PowValidationResponse { verified: false }))
-    }
-}
-
-#[inline]
-fn verify_challenge_cookie(cookie_str: &str, ip: &str, current_time: u64, secret: &[u8]) -> bool {
-    if let Some(arin_cookie) = cookie_str.split(';').find(|s| s.trim().starts_with("Arin=")) {
-        let hash = arin_cookie.trim_start_matches("Arin=").trim();
-        for t in (current_time.saturating_sub(COOKIE_VALIDITY_DURATION))..=current_time {
-            if hash == hash_ip_with_timestamp(ip, t, secret) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn generate_public_salt() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                             abcdefghijklmnopqrstuvwxyz\
-                             0123456789";
-    const SALT_LENGTH: usize = 32;
-    let mut rng = rand::thread_rng();
-
-    (0..SALT_LENGTH)
-        .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
-}
-
-// This is beta it's not very good.
-fn generate_pow_html(public_salt: &str, difficulty: u64) -> String {
-    let html = include_str!("pow_challenge.html");
-    html.replace("{public_salt}", public_salt)
-        .replace("{difficulty}", &difficulty.to_string())
-}
-
-#[inline]
-fn hash_ip_with_timestamp(ip: &str, timestamp: u64, secret: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(ip.as_bytes());
-    hasher.update(&timestamp.to_be_bytes());
-    hasher.update(secret);
-    hasher.finalize().to_hex().to_string()
-}
-
-/// Task Scheduler for cleaning up stale IP entries.
-async fn cleanup_stale_ip_requests(state: Arc<AppState>) {
-    loop {
-        sleep(Duration::from_secs(60)).await;
-        let now = Instant::now();
-        // Remove any IP whose last seen timestamp is older than IP_ENTRY_STALE_DURATION.
-        let stale_ips: Vec<String> = state
-            .ip_requests
-            .iter()
-            .filter_map(|entry| {
-                let (_, last_seen) = *entry.value();
-                if now.duration_since(last_seen).as_secs() > IP_ENTRY_STALE_DURATION {
-                    Some(entry.key().clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for ip in stale_ips {
-            state.ip_requests.remove(&ip);
-        }
-    }
-}
+use crate::config::{Config, DomainSettings};
+use crate::state::{AppState, IPBuckets, N_IP_BUCKETS};
+use crate::pow::PowVerifierPool;
+use crate::handlers::{validate_pow, handle_request, get_proxy_stats};
+use awc::Client as AwcClient;
+use awc::Connector as AwcConnector;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .tcp_keepalive(Some(Duration::from_secs(75)))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("Failed to build reqwest client");
+    // Initialize logging so info!/error! messages are visible without RUST_LOG set
+    // Commented out -> Env_logger adds extra overhead.
+    //env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    //    .format_timestamp_secs()
+    //    .init();
+    info!("Starting Arin Proxy");
+    info!("Loading configuration from config.json");
+    let config_file = match File::open("config.json") {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to open config.json: {}", e);
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("config.json not found: {}", e)));
+        }
+    };
+    let config: Config = match serde_json::from_reader(BufReader::new(config_file)) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Failed to parse config.json: {}", e);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid configuration file: {}", e)));
+        }
+    };
 
-    println!("Arin proxy is running on http://127.0.0.1:3000");
-    println!("Configured domains:");
-    for entry in STATE.domains.iter() {
-        let domain = entry.key();
-        let settings = entry.value();
-        println!(
-            "  {} -> {} (Cloudflare mode: {}, Initial stage: {})", 
-            domain, settings.backend, settings.cloudflare_mode, settings.current_stage
-        );
+    /*
+    It can be unsound to call std::env::set_var or std::env::remove_var
+    in a multithreaded program due to safety limitations of the way the process
+    environment is handled on some platforms. It is important to ensure that
+    these functions are not called when any other thread might be running.
+
+    It is safe in this context because we only call set_var at startup
+    before spawning any threads.
+    */
+    unsafe {
+        if config.allocator.large_os_pages {
+            env::set_var("MIMALLOC_LARGE_OS_PAGES", "1");
+        }
+        if config.allocator.eager_commit {
+            env::set_var("MIMALLOC_EAGER_COMMIT", "1");
+        }
+        if config.allocator.verbose {
+            env::set_var("MIMALLOC_VERBOSE", "1");
+        }
     }
 
-    let state_clone = STATE.clone();
-    tokio::spawn(async move {
-        cleanup_stale_ip_requests(state_clone).await;
-    });
+    // Globals
+    let domains_config = Arc::new(config.domains);
+    let cookie_key: [u8; 32] = *blake3::hash(config.cookie_secret.as_bytes()).as_bytes();
+    let stages_global: Arc<DashMap<String, Arc<AtomicU8>>> = Arc::new(DashMap::new());
+    let pin_pow_threads = config.runtime.pin_pow_threads;
+    let pow_pool = PowVerifierPool::new(
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4),
+        pin_pow_threads,
+    );
+    let global_total_requests = Arc::new(AtomicU64::new(0));
+    let global_challenged_requests = Arc::new(AtomicU64::new(0));
+    let global_allowed_requests = Arc::new(AtomicU64::new(0));
+    
+    info!("HTTP client config prepared");
+    info!("Arin proxy is running on http://127.0.0.1:3000");
+    info!("Configured domains:");
+    for (domain, settings) in domains_config.iter() {
+        let initial_stage = settings.stage.unwrap_or(0);
+        stages_global.insert(domain.clone(), Arc::new(AtomicU8::new(initial_stage)));
+        info!(
+            "  {} -> {} (Cloudflare mode: {}, Initial stage: {})", 
+            domain, settings.backend, settings.cloudflare_mode, initial_stage
+        );
+    }
+    info!("Starting HTTP server");
+    
+    let domains_config = domains_config.clone();
+    let stages_global_inner = stages_global.clone();
+    let pin_workers = config.runtime.pin_workers;
+    let worker_affinity_counter = Arc::new(AtomicUsize::new(0));
+    let server = HttpServer::new(move || {
+        /*
+          Pin worker to a CPU core on Windows.
+          Note: In this case it's only on the OS target windows. Linux doesn't have such limitation.
+          It's core API handles concurrency without needing to pin cores to workers. 
+        */ 
+        #[cfg(target_os = "windows")]
+        {
+            if pin_workers {
+                let n_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+                let idx = worker_affinity_counter.fetch_add(1, Ordering::Relaxed) % n_cpus;
+                unsafe { let _ = SetThreadAffinityMask(GetCurrentThread(), (1usize << idx) as usize); }
+            }
+        }
+        // Per-Worker Appstate functions
+        let domains_map: DashMap<String, DomainSettings> = DashMap::new();
+        for (k, v) in domains_config.iter() {
+            let mut s = v.clone();
+            s.current_stage = s.stage.unwrap_or(0);
+            s.last_reset = Some(Instant::now());
+            // AtomicU64 fields are already initialized to 0 by Default
+            // Cache global stage pointer for fast reads/writes
+            s.stage_ptr = stages_global_inner.get(k).map(|e| e.value().clone());
+            // Resolve backend DNS at startup to avoid runtime resolution
+            if config.runtime.resolve_dns_startup {
+                if let Some((host, port_str)) = s.backend.split_once(':') {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        use std::net::{ToSocketAddrs, SocketAddr};
+                        let addrs = (host, port).to_socket_addrs();
+                        if let Ok(mut iter) = addrs {
+                            if let Some(sa) = iter.find(|a| matches!(a, SocketAddr::V4(_) | SocketAddr::V6(_))) {
+                                s.backend = format!("{}:{}", sa.ip(), port);
+                            }
+                        }
+                    }
+                }
+            }
+            // Avoid per-request allocation/concat for domains.
+            if !s.backend.is_empty() {
+                let mut base = String::with_capacity(8 + s.backend.len());
+                if s.use_https { base.push_str("https://"); } else { base.push_str("http://"); }
+                base.push_str(&s.backend);
+                s.backend_base = base;
+            } else {
+                s.backend_base = String::new();
+            }
+            domains_map.insert(k.clone(), s);
+        }
+        let init_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let pool_limit = config.runtime.client_pool_limit.unwrap_or(256);
+        let conn_timeout = Duration::from_millis(config.runtime.client_connect_timeout_ms.unwrap_or(5000));
+        let keep_alive = Duration::from_secs(config.runtime.client_keep_alive_secs.unwrap_or(60));
+        let lifetime = Duration::from_secs(config.runtime.client_lifetime_secs.unwrap_or(300));
+        let connector = AwcConnector::new()
+            .limit(pool_limit)
+            .conn_keep_alive(keep_alive)
+            .conn_lifetime(lifetime)
+            .timeout(conn_timeout);
+        let http_client = AwcClient::builder()
+            .connector(connector)
+            .timeout(Duration::from_secs(30))
+            .finish();
+        let app_state = Arc::new(AppState {
+            domains: domains_map,
+            ip_buckets: IPBuckets::new(N_IP_BUCKETS, init_secs),
+            stages: stages_global_inner.clone(),
+            pow_pool: pow_pool.clone(),
+            cookie_key,
+            local_ip_acc: RefCell::new(vec![0u64; N_IP_BUCKETS]),
+            global_total_requests: global_total_requests.clone(),
+            global_challenged_requests: global_challenged_requests.clone(),
+            global_allowed_requests: global_allowed_requests.clone(),
+            http_client,
+        });
 
-    HttpServer::new(move || {
+        // Request Cleanup 
+        let cleanup_state = app_state.clone();
+        actix_web::rt::spawn(async move {
+            let mut interval = interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup_state.cleanup_old_requests();
+            }
+        });
+
         App::new()
-            .app_data(web::Data::new(STATE.clone()))
-            .app_data(web::Data::new(client.clone()))
+            .app_data(web::Data::new(app_state))
+            .route("/proxy/stats", web::get().to(get_proxy_stats))
+            .route("/pow/validate", web::post().to(validate_pow))
             .default_service(web::to(handle_request))
     })
-    .keep_alive(Duration::from_secs(75))                  // Server keep-alive setting.
-    .client_request_timeout(Duration::from_secs(30))       // Request timeout.
-    .client_disconnect_timeout(Duration::from_secs(5))     // Disconnect timeout.
     .bind("127.0.0.1:3000")?
-    .run()
-    .await
+    .backlog(2048)
+    .workers(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+    .keep_alive(Duration::from_secs(30))
+    .client_request_timeout(Duration::from_secs(30))
+    .shutdown_timeout(5)
+    .run();
+
+    info!("Starting proxy server on 127.0.0.1:3000");
+    server.await
 }
