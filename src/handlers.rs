@@ -122,6 +122,28 @@ pub async fn handle_request(
     let cookie_valid = verify_challenge_cookie(cookie_str, &ip, now_secs, &state.cookie_key);
     debug!("Cookie validation result: {} (IP: {}, Time: {})", cookie_valid, ip, now_secs);
 
+    // Media request check, this is to prevent PoW or the Javascript challenge from taking over the media resources.
+    // All media such a mp3, mp4, etc are cached on most CDNs but this is to fix an issue and also have some measure to defend
+    // against even if there is no caching.  
+    if !cookie_valid && is_media_request(&req) {
+        let cookie_value = create_challenge_cookie_value(&ip, now_secs, &state.cookie_key);
+        let mut resp = HttpResponse::Found();
+        let mut cookie = Cookie::build("Arin", cookie_value)
+            .path("/")
+            .http_only(true)
+            .finish();
+        cookie.set_same_site(actix_web::cookie::SameSite::None);
+        cookie.set_secure(true);
+
+        resp.cookie(cookie);
+        state.global_challenged_requests.fetch_add(1, Ordering::Relaxed);
+        return Ok(resp
+            .insert_header((header::LOCATION, req.uri().to_string()))
+            .insert_header((header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"))
+            .insert_header((header::PRAGMA, "no-cache"))
+            .finish());
+    }
+
     let (current_stage, backend_base, request_allowed) = match state.domains.get_mut(domain) {
         Some(mut domain_settings) => {
             domain_settings.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -530,4 +552,48 @@ fn is_hop_resp_header(name: &str) -> bool {
     ];
     for h in &H { if name.eq_ignore_ascii_case(h) { return true; } }
     false
+}
+
+#[inline]
+fn ends_with_ignore_ascii_case(hay: &str, suffix: &str) -> bool {
+    let hl = hay.len();
+    let sl = suffix.len();
+    if sl > hl { return false; }
+    hay[hl - sl..].eq_ignore_ascii_case(suffix)
+}
+
+#[inline]
+fn is_media_request(req: &HttpRequest) -> bool {
+    let headers = req.headers();
+
+    if headers.contains_key(header::RANGE) {
+        return true;
+    }
+    
+    if let Some(dest) = headers.get("Sec-Fetch-Dest").and_then(|v| v.to_str().ok()) {
+        if dest.eq_ignore_ascii_case("audio")
+            || dest.eq_ignore_ascii_case("video")
+            || dest.eq_ignore_ascii_case("track")
+            || dest.eq_ignore_ascii_case("media")
+        {
+            return true;
+        }
+    }
+
+    if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+        let a = accept.to_ascii_lowercase();
+        if a.contains("audio/") || a.contains("video/") {
+            return true;
+        }
+        if a.contains("application/vnd.apple.mpegurl") || a.contains("application/x-mpegurl") {
+            return true; 
+        }
+    }
+    let path = req.uri().path();
+    ends_with_ignore_ascii_case(path, ".mp3")
+        || ends_with_ignore_ascii_case(path, ".mp4")
+        || ends_with_ignore_ascii_case(path, ".m4a")
+        || ends_with_ignore_ascii_case(path, ".wav")
+        || ends_with_ignore_ascii_case(path, ".ogg")
+        || ends_with_ignore_ascii_case(path, ".webm")
 }
