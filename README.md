@@ -69,6 +69,3 @@ We heavily use **localized cache pointers** and concurrent hash maps (`DashMap`)
 Our PoW challenge is only **2 KB**, which is way smaller than most other services. We use **JSDelivr** to serve the static challenge assets, so your server doesn’t have to—this helps avoid saturating your port. On a **1 Gbps port**, you can handle **~45k RPS** just from the PoW stage.
 
 The other challenge stages (cookie + JS) are only a few bytes and require almost no effort—they’re completely invisible to the client. Users won’t even notice these checks are running.
-
-## License
-We have an MIT License; we are not liable or provide any warranty for this software. Please do your own due diligence if you are going to use this in production.
