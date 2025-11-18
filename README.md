@@ -41,7 +41,7 @@ This prevent automatic scanners like Shodan or Censys from leaking your backend 
 | **DDoS Protection**                 | ❌ Pay-per-attack (Shield Advanced: $3k+/month | ✅ **Built-in** (PoW + JS + Cookie challenges) |
 | **Egress Cost During Attack**       | ❌ **$0.1k – $50k+** (scales with response size)    | ✅ **$0 extra** (unmetered)                 |
 | **Scalability**                     |⚠️ Auto-scales (but at high cost)            | ✅ **Horizontally scalable** (multi-core, 10Gbps+) |
-| **Self-Hosted & Transparent**       | ❌ Black-box SaaS                            | ✅ Full control, MIT license                |
+| **Self-Hosted & Transparent**       | ❌ Black-box SaaS                            | ✅ Full control, GNU AGPL v3 license                |
 | **Attack Mitigation Latency**       |⚠️ Minutes (WAF rules, manual intervention, pain)  | ✅ **Sub-second** |
 
 `` Even if you run your own infra, it's just better to apply on top (except for API endpoints).  ``
