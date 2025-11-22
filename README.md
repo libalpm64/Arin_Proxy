@@ -1,11 +1,12 @@
 # Arin Proxy
-Arin Proxy is a high-performance, DDoS-protected reverse proxy designed to sit behind CDNs like Cloudflare/Sucuri/etc. It prevents DDoS attacks that exhaust your servers resources. 
 
-Rebuilt from the group up using May, Arin proxy uses stackful coroutines to deliver the absolute fastest speed possible out of Rust. 
+Arin Proxy is a high-performance, DDoS-protected reverse proxy designed to sit behind CDNs like Cloudflare, Sucuri, and others. It prevents DDoS attacks that exhaust your server's resources.
+
+**Rebuilt from the ground up using [May](https://github.com/Xudong-Huang/may),** Arin Proxy uses stackful coroutines to deliver the absolute fastest speed possible out of Rust.
 
 By pairing Arin Proxy with an unmetered dedicated server (e.g., Hetzner 10Gbps), you can mitigate massive HTTP/HTTPS floods (400k+ RPS). The bottleneck becomes your network bandwidth, not your CPU.
 
-All of this is supported by SIMD acceleration; most of the stack uses SIMD instructions tailored for server hardware. All libraries used are SIMD supported such as Blake3 and simd-json. 
+All of this is supported by **SIMD acceleration**; most of the stack uses SIMD instructions tailored for server hardware. All libraries used are SIMD supported, such as `blake3` for hashing and `simd-json` for parsing.
 
 ## How It Works
 
@@ -16,8 +17,8 @@ Arin Proxy filters traffic through three progressive stages. Legitimate users pa
 2.  **Stage 2: JavaScript Challenge**
     A tiny HTML payload ensures the client can execute JavaScript (Revamp soon).
 3.  **Stage 3: Proof of Work (PoW)**
-    If it bypasses the emulation checks, the proxy serves as a cryptographic challenge. The client must spend significant CPU time solving a generic hash. This makes the attack economically unviable: the attacker burns their resources while your server is chilling.
-    
+    If a client bypasses the emulation checks, the proxy serves a cryptographic challenge. The client must spend significant CPU time solving a generic hash. This makes the attack economically unviable: the attacker burns their resources while your server is chilling.
+
 ## Recommendations
 
 *   **Run Behind a CDN:** For maximum efficacy, place Arin Proxy behind Cloudflare.
