@@ -1,8 +1,10 @@
 use crate::config::DomainSettings;
-use awc::Client;
-use dashmap::DashMap;
+use http_body_util::Full;
+use bytes::Bytes;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use parking_lot::RwLock;
 use log::debug;
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -55,16 +57,16 @@ impl IPBuckets {
 }
 
 pub struct AppState {
-    pub domains: DashMap<String, DomainSettings>,
+    pub domains: RwLock<HashMap<String, DomainSettings>>,
     pub ip_buckets: IPBuckets,
-    pub stages: Arc<DashMap<String, Arc<AtomicU8>>>,
+    pub stages: Arc<HashMap<String, Arc<AtomicU8>>>,
     pub pow_pool: Arc<crate::pow::PowVerifierPool>,
     pub cookie_key: [u8; 32],
-    pub local_ip_acc: RefCell<Vec<u64>>, 
+    pub local_ip_acc: Mutex<Vec<u64>>, 
     pub global_total_requests: Arc<AtomicU64>,
     pub global_challenged_requests: Arc<AtomicU64>,
     pub global_allowed_requests: Arc<AtomicU64>,
-    pub http_client: Client,
+    pub http_client: Client<HttpConnector, Full<Bytes>>,
 }
 
 impl AppState {
@@ -81,10 +83,9 @@ impl AppState {
     pub fn ip_update_and_get_batched(&self, ip: &str, now_secs: u64, stale_secs: u64) -> u64 {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
-        let mut acc = self.local_ip_acc.borrow_mut();
+        let mut acc = self.local_ip_acc.lock();
         let entry = &mut acc[idx];
         if now_secs.saturating_sub(last) > stale_secs {
-            // stale: reset global and local
             self.ip_buckets.counts[idx].store(1, Ordering::Relaxed);
             self.ip_buckets.last_reset_secs[idx].store(now_secs, Ordering::Relaxed);
             *entry = 0;
@@ -93,7 +94,6 @@ impl AppState {
             *entry = entry.saturating_add(1);
             let prev = self.ip_buckets.counts[idx].load(Ordering::Relaxed);
             let total = prev.saturating_add(*entry);
-            // flush when batch reaches threshold to keep global counters reasonably fresh
             if *entry >= 16 {
                 self.ip_buckets.counts[idx].store(total, Ordering::Relaxed);
                 *entry = 0;
@@ -106,7 +106,7 @@ impl AppState {
     pub fn ip_update_local_batch(&self, ip: &str, now_secs: u64, stale_secs: u64) {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
-        let mut acc = self.local_ip_acc.borrow_mut();
+        let mut acc = self.local_ip_acc.lock();
         let entry = &mut acc[idx];
         if now_secs.saturating_sub(last) > stale_secs {
             self.ip_buckets.counts[idx].store(1, Ordering::Relaxed);
