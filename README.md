@@ -24,3 +24,6 @@ Arin Proxy filters traffic through three progressive stages. Legitimate users pa
 *   **Hardware:** A multi-core dedicated server with **AVX2 support** is recommended.
 *   **Network:** A 10Gbps+ unmetered line is ideal. The PoW stage uses bandwidth to exhaust the attacker's CPU.
 *   **Security:** Whitelist your CDN's IP ranges (e.g., Cloudflare IPs) in your firewall (`iptables`/`ufw`) to prevent attackers from bypassing the proxy.
+
+## License
+GNU Affero General Public License v3.0
