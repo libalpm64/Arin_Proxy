@@ -18,6 +18,7 @@ pub const IP_ENTRY_STALE_DURATION: u64 = 60;
 pub const SOFT_RL_LIMIT: u64 = 800;
 pub const HARD_RL_LIMIT: u64 = 1000;
 pub const MAX_BACKOFF_MS: u64 = 200;
+pub const CHALLENGE_TTL_SECS: u64 = 300;
 
 #[derive(Deserialize)]
 pub struct PowValidationRequest {
@@ -40,24 +41,40 @@ pub struct ProxyStats {
 pub async fn handle_request(
     req: Request<Incoming>,
     state: std::sync::Arc<AppState>,
-    remote_ip: String,
+    remote_addr: std::net::SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    let client_ip = remote_ip;
 
-    // fixed-bucket counters setup for ratleimits.
-    // approates a sliding time window efficently.
-    // tracks per-IP or per-request counts without unbounded memory growth or heap churn. 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    // Increment global request counter immediately; no per-domain iteration required
-    // Saves on slow syscalls by not required to fetch from other locations.
-    // Avoids having to put it in the jump table as it's just saved as rcx, rax, rdi. (Avoids relocations)
     state.global_total_requests.fetch_add(1, Ordering::Relaxed);
+    let domain = match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
+        Some(domain) => domain,
+        None => {
+            let resp = Response::builder().status(StatusCode::BAD_REQUEST);
+            return Ok(resp.body(full_body(Bytes::from_static(b"Invalid domain"))).unwrap());
+        }
+    };
+    
+    if req.method() == hyper::Method::POST && req.uri().path() == "/pow/validate" {
+        return validate_pow(req, state).await;
+    }
+
+    let ip = derive_ip(&req, domain, &state, &remote_addr).unwrap_or_else(|| {
+        warn!("Could not determine client IP for domain: {}", domain);
+        "".to_string()
+    });
+
+    if ip.is_empty() {
+        warn!("Empty IP address for domain: {}", domain);
+        let resp = Response::builder().status(StatusCode::BAD_REQUEST);
+        return Ok(resp.body(full_body(Bytes::from_static(b"Cannot determine client IP"))).unwrap());
+    }
+
     let request_count = state
-        .ip_update_and_get_batched(&client_ip, now_secs, IP_ENTRY_STALE_DURATION);
+        .ip_update_and_get_batched(&ip, now_secs, IP_ENTRY_STALE_DURATION);
 
     if request_count >= SOFT_RL_LIMIT {
         let backoff_ms = ((request_count - SOFT_RL_LIMIT) * MAX_BACKOFF_MS)
@@ -74,33 +91,10 @@ pub async fn handle_request(
         resp = resp.header("X-Backoff-ms", MAX_BACKOFF_MS.to_string());
         return Ok(resp.body(full_body(Bytes::from_static(b"Too many requests"))).unwrap());
     }
-    let domain = match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
-        Some(domain) => domain,
-        None => {
-            let resp = Response::builder().status(StatusCode::BAD_REQUEST);
-            return Ok(resp.body(full_body(Bytes::from_static(b"Invalid domain"))).unwrap());
-        }
-    };
-        
-    if req.method() == hyper::Method::POST && req.uri().path() == "/pow/validate" {
-        return validate_pow(req, state).await;
-    }
 
-    let ip = derive_ip(&req, domain, &state, &client_ip).unwrap_or_else(|| {
-        warn!("Could not determine client IP for domain: {}", domain);
-        "".to_string()
-    });
-
-    if ip.is_empty() {
-        warn!("Empty IP address for domain: {}", domain);
-        let resp = Response::builder().status(StatusCode::BAD_REQUEST);
-        return Ok(resp.body(full_body(Bytes::from_static(b"Cannot determine client IP"))).unwrap());
-    }
-
-    // Update IP request tracking with batched local increments (no immediate readback)
-    // Avoid double counting if CF-Connecting-IP equals the connection IP
-    if ip != client_ip {
-        state.ip_update_local_batch(&ip, now_secs, IP_ENTRY_STALE_DURATION);
+    if ip != remote_addr.ip().to_string() {
+        let remote_ip_str = remote_addr.ip().to_string();
+        state.ip_update_local_batch(&remote_ip_str, now_secs, IP_ENTRY_STALE_DURATION);
     }
 
     let cookie_str = req
@@ -129,53 +123,31 @@ pub async fn handle_request(
     }
 
     let (current_stage, backend_base, request_allowed) = {
-        let mut guard = state.domains.write();
-        if let Some(domain_settings) = guard.get_mut(domain) {
-            domain_settings.total_requests.fetch_add(1, Ordering::Relaxed);
-            if domain_settings
-                .last_reset
-                .map_or(true, |last_reset| last_reset.elapsed() >= Duration::from_secs(1))
-            {
-                if domain_settings.bypassed_requests.load(Ordering::Relaxed) >= STAGE_THRESHOLD {
-                    if let Some(stage_arc) = domain_settings.stage_ptr.as_ref() {
-                        let cur = stage_arc.load(Ordering::Relaxed);
-                        let new = (cur + 1).min(3);
-                        stage_arc.store(new, Ordering::Relaxed);
-                        domain_settings.current_stage = new;
-                        debug!("Domain {} advanced to stage {}", domain, new);
-                    } else if let Some(stage_arc) = state.stages.get(domain) {
-                        let cur = stage_arc.load(Ordering::Relaxed);
-                        let new = (cur + 1).min(3);
-                        stage_arc.store(new, Ordering::Relaxed);
-                        domain_settings.current_stage = new;
-                        debug!("Domain {} advanced to stage {}", domain, new);
-                    }
+        if let Some(d) = state.domains.get(domain) {
+            d.total_requests.fetch_add(1, Ordering::Relaxed);
+            let now = now_secs;
+            let last = d.last_reset_secs.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 1 {
+                if d.bypassed_requests.load(Ordering::Relaxed) >= STAGE_THRESHOLD {
+                    let cur = d.stage.load(Ordering::Relaxed);
+                    let new = (cur + 1).min(3);
+                    d.stage.store(new, Ordering::Relaxed);
+                    debug!("Domain {} advanced to stage {}", domain, new);
                 }
-                domain_settings.bypassed_requests.store(0, Ordering::Relaxed);
-                domain_settings.last_reset = Some(std::time::Instant::now());
+                d.bypassed_requests.store(0, Ordering::Relaxed);
+                d.last_reset_secs.store(now, Ordering::Relaxed);
             }
-            let stage = if let Some(stage_arc) = domain_settings.stage_ptr.as_ref() {
-                stage_arc.load(Ordering::Relaxed)
-            } else {
-                state
-                    .stages
-                    .get(domain)
-                    .map(|e| e.load(Ordering::Relaxed))
-                    .unwrap_or(domain_settings.current_stage)
-            };
+            let stage = d.stage.load(Ordering::Relaxed);
             let allowed = match stage {
                 0 => true,
-                1 | 2 => cookie_valid,
-                3 => { 
-                    cookie_valid
-                },
+                1 | 2 | 3 => cookie_valid,
                 _ => false,
             };
             if !cookie_valid && (1..=3).contains(&stage) {
             } else if allowed {
-                domain_settings.bypassed_requests.fetch_add(1, Ordering::Relaxed);
+                d.bypassed_requests.fetch_add(1, Ordering::Relaxed);
             }
-            (stage, domain_settings.backend_base.clone(), allowed)
+            (stage, d.backend_base.clone(), allowed)
         } else {
             warn!("Request for unconfigured domain: {}", domain);
             let resp = Response::builder().status(StatusCode::NOT_FOUND);
@@ -278,7 +250,6 @@ pub async fn validate_pow(
     let verified = verified_rx.await.unwrap_or(false);
 
     if verified {
-        // Ensure consistent client IP derivation with handle_request (strip port and use CF header when available)
         let domain = parts
             .headers
             .get(header::HOST)
@@ -297,14 +268,11 @@ pub async fn validate_pow(
         
         info!("PoW validation successful for IP: {}", ip);
         
-        {
-            let mut guard = state.domains.write();
-            if let Some(domain_settings) = guard.get_mut(domain) {
-                domain_settings.bypassed_requests.fetch_add(1, Ordering::Relaxed);
-                domain_settings.last_pow_success = Some(now_secs);
-                debug!("PoW completion counted for domain {}: {} bypassed, last success: {}",
-                      domain, domain_settings.bypassed_requests.load(Ordering::Relaxed), now_secs);
-            }
+        if let Some(d) = state.domains.get(domain) {
+            d.bypassed_requests.fetch_add(1, Ordering::Relaxed);
+            d.last_pow_success.store(now_secs, Ordering::Relaxed);
+            debug!("PoW completion counted for domain {}: {} bypassed, last success: {}",
+                  domain, d.bypassed_requests.load(Ordering::Relaxed), now_secs);
         }
         let json = serde_json::to_vec(&PowValidationResponse { verified: true }).unwrap_or_default();
         let mut resp = Response::builder().status(StatusCode::OK);
@@ -365,8 +333,10 @@ async fn proxy_request(
     out_req = out_req.header(header::HOST, original_host);
 
     // Disable automatic compression in the request builder. Saves CPU utilization by using Zero-Copy Costs.
-    let body_bytes = req.into_body().collect().await?.to_bytes();
-    let out_req = out_req.body(Full::from(body_bytes)).unwrap();
+    // Stream body to backend to avoid buffering
+    let incoming = req.into_body();
+    let out_req = out_req.body(incoming.boxed()).unwrap();
+    let _permit = state.backend_sem.clone().acquire_owned().await.unwrap();
     let backend_response = match state.http_client.request(out_req).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -397,7 +367,20 @@ async fn proxy_request(
 
 #[inline]
 fn create_challenge_cookie_value(ip: &str, timestamp: u64, key: &[u8; 32]) -> String {
-    hash_ip_with_timestamp(ip, timestamp, key)
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(ip.as_bytes());
+    hasher.update(&timestamp.to_be_bytes());
+    let bytes = hasher.finalize();
+    let raw = bytes.as_bytes();
+    let ts_str = timestamp.to_string();
+    let mut out = String::with_capacity(ts_str.len() + 1 + raw.len() * 2);
+    out.push_str(&ts_str);
+    out.push(':');
+    for &b in raw {
+        out.push(HEX_CHARS[(b >> 4) as usize] as char);
+        out.push(HEX_CHARS[(b & 0x0F) as usize] as char);
+    }
+    out
 }
 
 #[inline]
@@ -410,13 +393,17 @@ fn verify_challenge_cookie(cookie_str: &str, ip: &str, current_time: u64, key: &
         });
 
     if let Some(provided) = provided_opt {
-        // Compute expected hash at current_time only; accept slight clock skew by checking previous seconds.
-        // This keeps verification O(1) with small constant steps.
-        for dt in 0..=60 {
-            let t = current_time.saturating_sub(dt);
-            let expected = hash_ip_with_timestamp(ip, t, key);
-            if ct_eq(provided.as_bytes(), expected.as_bytes()) {
-                return true;
+        if let Some((ts_part, hex_part)) = provided.split_once(':') {
+            if let Ok(ts) = ts_part.parse::<u64>() {
+                if ts <= current_time {
+                    let delta = current_time - ts;
+                    if delta <= CHALLENGE_TTL_SECS {
+                        let expected = hash_ip_with_timestamp(ip, ts, key);
+                        if ct_eq(hex_part.as_bytes(), expected.as_bytes()) {
+                            return true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -472,48 +459,45 @@ pub async fn get_proxy_stats(
     Ok(resp.body(full_body(Bytes::from(body))).unwrap())
 }
 #[inline]
-fn derive_ip(req: &Request<Incoming>, domain: &str, state: &AppState, fallback: &str) -> Option<String> {
-    let guard = state.domains.read();
-    if let Some(domain_settings) = guard.get(domain) {
-        if domain_settings.cloudflare_mode {
+fn derive_ip(req: &Request<Incoming>, domain: &str, state: &AppState, fallback: &std::net::SocketAddr) -> Option<String> {
+    if let Some(d) = state.domains.get(domain) {
+        if d.cloudflare_mode {
             return req.headers().get("CF-Connecting-IP").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
         }
     }
-    Some(fallback.split(':').next().unwrap_or("").to_string())
+    Some(fallback.ip().to_string())
 }
 #[inline]
 fn is_hop_req_header(name: &str) -> bool {
-    const H: [&str; 10] = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "host",
-        "accept-encoding",
-    ];
-    for h in &H { if name.eq_ignore_ascii_case(h) { return true; } }
-    false
+    match name {
+        n if n.eq_ignore_ascii_case("connection") => true,
+        n if n.eq_ignore_ascii_case("keep-alive") => true,
+        n if n.eq_ignore_ascii_case("proxy-authenticate") => true,
+        n if n.eq_ignore_ascii_case("proxy-authorization") => true,
+        n if n.eq_ignore_ascii_case("te") => true,
+        n if n.eq_ignore_ascii_case("trailers") => true,
+        n if n.eq_ignore_ascii_case("transfer-encoding") => true,
+        n if n.eq_ignore_ascii_case("upgrade") => true,
+        n if n.eq_ignore_ascii_case("host") => true,
+        n if n.eq_ignore_ascii_case("accept-encoding") => true,
+        _ => false,
+    }
 }
 
 #[inline]
 fn is_hop_resp_header(name: &str) -> bool {
-    const H: [&str; 9] = [
-        "content-length",
-        "transfer-encoding",
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "upgrade",
-    ];
-    for h in &H { if name.eq_ignore_ascii_case(h) { return true; } }
-    false
+    match name {
+        n if n.eq_ignore_ascii_case("content-length") => true,
+        n if n.eq_ignore_ascii_case("transfer-encoding") => true,
+        n if n.eq_ignore_ascii_case("connection") => true,
+        n if n.eq_ignore_ascii_case("keep-alive") => true,
+        n if n.eq_ignore_ascii_case("proxy-authenticate") => true,
+        n if n.eq_ignore_ascii_case("proxy-authorization") => true,
+        n if n.eq_ignore_ascii_case("te") => true,
+        n if n.eq_ignore_ascii_case("trailers") => true,
+        n if n.eq_ignore_ascii_case("upgrade") => true,
+        _ => false,
+    }
 }
 
 #[inline]
@@ -563,12 +547,12 @@ fn is_media_request(req: &Request<Incoming>) -> bool {
 pub async fn route(
     req: Request<Incoming>,
     state: std::sync::Arc<AppState>,
-    remote_ip: String,
+    remote_addr: std::net::SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&hyper::Method::GET, "/proxy/stats") => get_proxy_stats(state).await,
         (&hyper::Method::POST, "/pow/validate") => validate_pow(req, state).await,
-        _ => handle_request(req, state, remote_ip).await,
+        _ => handle_request(req, state, remote_addr).await,
     }
 }
 

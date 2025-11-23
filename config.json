@@ -1,13 +1,15 @@
 {
   "domains": {
-    "example.org": {
+    "libalpm.dev": {
       "backend": "127.0.0.1:8000",
       "cloudflare_mode": true,
-      "stage": 1
+      "use_https": false,
+      "stage": 3
     },
     "example.arinproxy": {
       "backend": "127.0.0.1:8000",
       "cloudflare_mode": true,
+      "use_https": false,
       "stage": 1
     }
   },

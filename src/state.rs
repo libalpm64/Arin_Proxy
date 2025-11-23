@@ -1,14 +1,12 @@
-use crate::config::DomainSettings;
-use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
 use bytes::Bytes;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use parking_lot::RwLock;
-use log::debug;
-use parking_lot::Mutex;
 use std::collections::HashMap;
+use log::debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 /*
 Use 64K buckets to ensure predictable memory usage and good cache locality.
@@ -56,17 +54,28 @@ impl IPBuckets {
     }
 }
 
+pub struct DomainRuntime {
+    pub backend_base: String,
+    pub cloudflare_mode: bool,
+    pub total_requests: AtomicU64,
+    pub bypassed_requests: AtomicU64,
+    pub blocked_requests: AtomicU64,
+    pub last_reset_secs: AtomicU64,
+    pub last_pow_success: AtomicU64,
+    pub stage: Arc<AtomicU8>,
+}
+
 pub struct AppState {
-    pub domains: RwLock<HashMap<String, DomainSettings>>,
+    pub domains: Arc<HashMap<String, Arc<DomainRuntime>>>,
     pub ip_buckets: IPBuckets,
-    pub stages: Arc<HashMap<String, Arc<AtomicU8>>>,
     pub pow_pool: Arc<crate::pow::PowVerifierPool>,
     pub cookie_key: [u8; 32],
-    pub local_ip_acc: Mutex<Vec<u64>>, 
+    pub local_ip_acc: Box<[AtomicU64]>,
     pub global_total_requests: Arc<AtomicU64>,
     pub global_challenged_requests: Arc<AtomicU64>,
     pub global_allowed_requests: Arc<AtomicU64>,
-    pub http_client: Client<HttpConnector, Full<Bytes>>,
+    pub http_client: Client<HttpConnector, BoxBody<Bytes, hyper::Error>>,
+    pub backend_sem: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -83,22 +92,22 @@ impl AppState {
     pub fn ip_update_and_get_batched(&self, ip: &str, now_secs: u64, stale_secs: u64) -> u64 {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
-        let mut acc = self.local_ip_acc.lock();
-        let entry = &mut acc[idx];
         if now_secs.saturating_sub(last) > stale_secs {
             self.ip_buckets.counts[idx].store(1, Ordering::Relaxed);
             self.ip_buckets.last_reset_secs[idx].store(now_secs, Ordering::Relaxed);
-            *entry = 0;
+            self.local_ip_acc[idx].store(0, Ordering::Relaxed);
             1
         } else {
-            *entry = entry.saturating_add(1);
-            let prev = self.ip_buckets.counts[idx].load(Ordering::Relaxed);
-            let total = prev.saturating_add(*entry);
-            if *entry >= 16 {
+            let entry = self.local_ip_acc[idx].fetch_add(1, Ordering::Relaxed) + 1;
+            if entry >= 16 {
+                let prev = self.ip_buckets.counts[idx].load(Ordering::Relaxed);
+                let total = prev.saturating_add(entry);
                 self.ip_buckets.counts[idx].store(total, Ordering::Relaxed);
-                *entry = 0;
+                self.local_ip_acc[idx].store(0, Ordering::Relaxed);
+                total
+            } else {
+                self.ip_buckets.counts[idx].load(Ordering::Relaxed).saturating_add(entry)
             }
-            total
         }
     }
 
@@ -106,19 +115,17 @@ impl AppState {
     pub fn ip_update_local_batch(&self, ip: &str, now_secs: u64, stale_secs: u64) {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
-        let mut acc = self.local_ip_acc.lock();
-        let entry = &mut acc[idx];
         if now_secs.saturating_sub(last) > stale_secs {
             self.ip_buckets.counts[idx].store(1, Ordering::Relaxed);
             self.ip_buckets.last_reset_secs[idx].store(now_secs, Ordering::Relaxed);
-            *entry = 0;
+            self.local_ip_acc[idx].store(0, Ordering::Relaxed);
         } else {
-            *entry = entry.saturating_add(1);
-            if *entry >= 32 {
+            let entry = self.local_ip_acc[idx].fetch_add(1, Ordering::Relaxed) + 1;
+            if entry >= 32 {
                 let prev = self.ip_buckets.counts[idx].load(Ordering::Relaxed);
-                let total = prev.saturating_add(*entry);
+                let total = prev.saturating_add(entry);
                 self.ip_buckets.counts[idx].store(total, Ordering::Relaxed);
-                *entry = 0;
+                self.local_ip_acc[idx].store(0, Ordering::Relaxed);
             }
         }
     }

@@ -94,6 +94,12 @@ pub struct RuntimeOpts {
     pub client_lifetime_secs: Option<u64>,
     #[serde(default)]
     pub resolve_dns_startup: bool,
+    #[serde(default)]
+    pub client_max_concurrency: Option<usize>,
+    #[serde(default)]
+    pub client_http2_only: bool,
+    #[serde(default)]
+    pub server_max_connections: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]

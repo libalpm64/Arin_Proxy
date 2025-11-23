@@ -4,12 +4,11 @@ mod pow;
 mod handlers;
 mod blake3;
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -17,12 +16,14 @@ use hyper_util::rt::TokioIo;
 use hyper::{Request};
 use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
-use http_body_util::Full;
+use hyper_util::rt::TokioTimer;
+use tokio::sync::Semaphore;
+use socket2::{SockRef, TcpKeepalive};
+use http_body_util::combinators::BoxBody;
 use bytes::Bytes;
-use parking_lot::RwLock;
 use log::{info, error};
 
-use crate::config::{Config, DomainSettings};
+use crate::config::Config;
 use crate::state::{AppState, IPBuckets, N_IP_BUCKETS};
 use crate::pow::PowVerifierPool;
  
@@ -66,23 +67,19 @@ async fn main() -> std::io::Result<()> {
     info!("HTTP client config prepared");
     info!("Arin proxy is running on http://127.0.0.1:3000");
     info!("Configured domains:");
-    let mut stages_map: HashMap<String, Arc<AtomicU8>> = HashMap::new();
     for (domain, settings) in domains_config.iter() {
         let initial_stage = settings.stage.unwrap_or(0);
-        stages_map.insert(domain.clone(), Arc::new(AtomicU8::new(initial_stage)));
         info!(
             "  {} -> {} (Cloudflare mode: {}, Initial stage: {})", 
             domain, settings.backend, settings.cloudflare_mode, initial_stage
         );
     }
-    let stages_global = Arc::new(stages_map);
     info!("Starting HTTP server");
-    let mut domains_map: HashMap<String, DomainSettings> = HashMap::new();
+    let init_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut domains_map: HashMap<String, Arc<crate::state::DomainRuntime>> = HashMap::new();
     for (k, v) in domains_config.iter() {
         let mut s = v.clone();
-        s.current_stage = s.stage.unwrap_or(0);
-        s.last_reset = Some(Instant::now());
-        s.stage_ptr = stages_global.get(k).cloned();
+        let stage_arc = Arc::new(AtomicU8::new(s.stage.unwrap_or(0)));
         if config.runtime.resolve_dns_startup {
             if let Some((host, port_str)) = s.backend.split_once(':') {
                 if let Ok(port) = port_str.parse::<u16>() {
@@ -100,25 +97,60 @@ async fn main() -> std::io::Result<()> {
             let mut base = String::with_capacity(8 + s.backend.len());
             if s.use_https { base.push_str("https://"); } else { base.push_str("http://"); }
             base.push_str(&s.backend);
-            s.backend_base = base;
+            let runtime = crate::state::DomainRuntime {
+                backend_base: base,
+                cloudflare_mode: s.cloudflare_mode,
+                total_requests: AtomicU64::new(0),
+                bypassed_requests: AtomicU64::new(0),
+                blocked_requests: AtomicU64::new(0),
+                last_reset_secs: AtomicU64::new(init_secs),
+                last_pow_success: AtomicU64::new(0),
+                stage: stage_arc.clone(),
+            };
+            domains_map.insert(k.clone(), Arc::new(runtime));
         } else {
-            s.backend_base = String::new();
+            let runtime = crate::state::DomainRuntime {
+                backend_base: String::new(),
+                cloudflare_mode: s.cloudflare_mode,
+                total_requests: AtomicU64::new(0),
+                bypassed_requests: AtomicU64::new(0),
+                blocked_requests: AtomicU64::new(0),
+                last_reset_secs: AtomicU64::new(init_secs),
+                last_pow_success: AtomicU64::new(0),
+                stage: stage_arc.clone(),
+            };
+            domains_map.insert(k.clone(), Arc::new(runtime));
         }
-        domains_map.insert(k.clone(), s);
     }
-    let init_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let http_client: HyperClient<HttpConnector, Full<Bytes>> = HyperClient::builder(TokioExecutor::new()).build_http();
+    let mut connector = HttpConnector::new();
+    let connect_timeout_ms = config.runtime.client_connect_timeout_ms.unwrap_or(3000);
+    connector.set_connect_timeout(Some(Duration::from_millis(connect_timeout_ms)));
+    let keep_alive_secs = config.runtime.client_keep_alive_secs.unwrap_or(30);
+    connector.set_keepalive(Some(Duration::from_secs(keep_alive_secs)));
+    connector.set_nodelay(true);
+    let mut client_builder = HyperClient::builder(TokioExecutor::new());
+    let pool_limit = config.runtime.client_pool_limit.unwrap_or(128);
+    client_builder.pool_max_idle_per_host(pool_limit);
+    let pool_idle_secs = config.runtime.client_lifetime_secs.unwrap_or(15);
+    client_builder.pool_timer(TokioTimer::new()).pool_idle_timeout(Duration::from_secs(pool_idle_secs));
+    if config.runtime.client_http2_only { client_builder.http2_only(true); }
+    let http_client: HyperClient<HttpConnector, BoxBody<Bytes, hyper::Error>> = client_builder.build(connector);
+    let max_conc = config.runtime.client_max_concurrency.unwrap_or(512);
     let app_state = Arc::new(AppState {
-        domains: RwLock::new(domains_map),
+        domains: Arc::new(domains_map),
         ip_buckets: IPBuckets::new(N_IP_BUCKETS, init_secs),
-        stages: stages_global.clone(),
         pow_pool: pow_pool.clone(),
         cookie_key,
-        local_ip_acc: parking_lot::Mutex::new(vec![0u64; N_IP_BUCKETS]),
+        local_ip_acc: {
+            let mut v: Vec<std::sync::atomic::AtomicU64> = Vec::with_capacity(N_IP_BUCKETS);
+            for _ in 0..N_IP_BUCKETS { v.push(std::sync::atomic::AtomicU64::new(0)); }
+            v.into_boxed_slice()
+        },
         global_total_requests: global_total_requests.clone(),
         global_challenged_requests: global_challenged_requests.clone(),
         global_allowed_requests: global_allowed_requests.clone(),
         http_client,
+        backend_sem: Arc::new(Semaphore::new(max_conc)),
     });
     let cleanup_state = app_state.clone();
     tokio::spawn(async move {
@@ -130,19 +162,46 @@ async fn main() -> std::io::Result<()> {
     });
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
+    let conn_sem = Arc::new(Semaphore::new(4096));
     info!("Starting proxy server on 127.0.0.1:3000");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+
+        let keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        let sockref = SockRef::from(&stream);
+        if let Err(e) = sockref.set_tcp_keepalive(&keepalive) {
+            log::warn!("Failed to set TCP keepalive: {}", e);
+        }
+
         let state = app_state.clone();
+        let permit = conn_sem.clone().acquire_owned().await.unwrap();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let remote_ip = peer.ip().to_string();
+            let remote_addr = peer;
+            let jitter = ((peer.port() as u64) & 3) + 1;
+            let header_timeout = Duration::from_secs(8 + jitter);
             if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(move |req: Request<hyper::body::Incoming>| handlers::route(req, state.clone(), remote_ip.clone())))
+                .timer(TokioTimer::new())
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .keep_alive(true)
+                .header_read_timeout(header_timeout)
+                .serve_connection(io, service_fn(move |req: Request<hyper::body::Incoming>| handlers::route(req, state.clone(), remote_addr)))
                 .await
             {
-                error!("Error serving connection: {}", err);
+                log::debug!("Error serving connection: {}", err);
             }
+            drop(permit);
         });
     }
 }
+use std::collections::HashMap;
