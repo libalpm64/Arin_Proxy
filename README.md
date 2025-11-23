@@ -1,16 +1,14 @@
 # Arin Proxy
 
-Arin Proxy is a DDoS-protected reverse proxy designed to run behind CDNs like Cloudflare. It helps prevent bypass attempts that could overwhelm your application. Built using the Actix Web framework, Arin Proxy is both fast and feature-rich and optimized for high performance, with various challenges to mitigate HTTP/HTTPS DDoS attacks without taxing the client's backend server.
+Arin Proxy is a DDoS-protected reverse proxy designed to run behind CDNs like Cloudflare. It helps prevent bypass attempts that could overwhelm your application. Built using Hyper, Arin Proxy is both fast and feature-rich and optimized for high performance, with various challenges to mitigate HTTP/HTTPS DDoS attacks without taxing the client's backend server.
 
 Arin Proxy's primary goal is to cut costs from HTTP/HTTPS DDoS attacks; the cost for ingress/egress traffic on most services is expensive. This, paired with a hosting such as Hetzner (or any unmetered dedicated server seller) with a 10 GB NIC/Port speed, you can handle up to 400k RPS on 1 server. It isn't CPU-bound; you will likely run out of bandwidth before this proxy uses up your entire system's resources. 
-
-In contrast, my other project, LostLab Proxy, utilizes the Actix Web framework with HTTP/2 for slightly faster performance. However, Arin Proxy is designed to be more feature-rich. It integrates seamlessly with existing infrastructures (IaaS), including Cloudflare and other CDNs.
 
 ## Key Features
 
 - **Multi-threaded:** Arin Proxy makes use of multi-core systems, allowing it to handle increased traffic effectively and very quickly.
 - **Blocks Automated Bots:** Being new, Arin Proxy does not yet have specific signatures for AI scrapers, crawlers, and other automated bots, unintentionally providing protection from such vexations.
-- **Expandable:** Actix Web offers numerous load-balancing technologies, with many resources available for implementing multi-server and origin configurations.
+- **Expandable:** Hyper offers numerous load-balancing technologies, with many resources available for implementing multi-server and origin configurations.
 
 ## What Does Arin Proxy Do?
 
