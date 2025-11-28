@@ -529,7 +529,6 @@ fn is_media_request<B>(req: &Request<B>) -> bool {
     }
 
     if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
-        // Optimized: avoid to_ascii_lowercase allocation
         if accept.split(',').any(|part| {
             let p = part.trim();
             p.eq_ignore_ascii_case("audio/") || p.starts_with("audio/") ||
