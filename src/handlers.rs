@@ -9,6 +9,7 @@ use log::{info, warn, error, debug};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::atomic::Ordering;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::state::AppState;
 use crate::pow::{POW_DIFFICULTY, generate_challenge_secret, generate_pow_html};
@@ -41,7 +42,7 @@ pub struct ProxyStats {
 pub async fn handle_request(
     req: Request<Incoming>,
     state: std::sync::Arc<AppState>,
-    remote_addr: std::net::SocketAddr,
+    remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
 
     let now_secs = SystemTime::now()
@@ -62,19 +63,17 @@ pub async fn handle_request(
         return validate_pow(req, state).await;
     }
 
-    let ip = derive_ip(&req, domain, &state, &remote_addr).unwrap_or_else(|| {
-        warn!("Could not determine client IP for domain: {}", domain);
-        "".to_string()
-    });
-
-    if ip.is_empty() {
-        warn!("Empty IP address for domain: {}", domain);
-        let resp = Response::builder().status(StatusCode::BAD_REQUEST);
-        return Ok(resp.body(full_body(Bytes::from_static(b"Cannot determine client IP"))).unwrap());
-    }
+    let ip = match derive_ip(&req, domain, &state, &remote_addr) {
+        Some(ip) => ip,
+        None => {
+            warn!("Could not determine client IP for domain: {}", domain);
+            let resp = Response::builder().status(StatusCode::BAD_REQUEST);
+            return Ok(resp.body(full_body(Bytes::from_static(b"Cannot determine client IP"))).unwrap());
+        }
+    };
 
     let request_count = state
-        .ip_update_and_get_batched(&ip, now_secs, IP_ENTRY_STALE_DURATION);
+        .ip_update_and_get_batched(ip, now_secs, IP_ENTRY_STALE_DURATION);
 
     if request_count >= SOFT_RL_LIMIT {
         let backoff_ms = ((request_count - SOFT_RL_LIMIT) * MAX_BACKOFF_MS)
@@ -92,9 +91,8 @@ pub async fn handle_request(
         return Ok(resp.body(full_body(Bytes::from_static(b"Too many requests"))).unwrap());
     }
 
-    if ip != remote_addr.ip().to_string() {
-        let remote_ip_str = remote_addr.ip().to_string();
-        state.ip_update_local_batch(&remote_ip_str, now_secs, IP_ENTRY_STALE_DURATION);
+    if ip != remote_addr.ip() {
+        state.ip_update_local_batch(remote_addr.ip(), now_secs, IP_ENTRY_STALE_DURATION);
     }
 
     let cookie_str = req
@@ -104,14 +102,12 @@ pub async fn handle_request(
         .unwrap_or("");
 
     debug!("Cookie string received: {}", cookie_str);
-    let cookie_valid = verify_challenge_cookie(cookie_str, &ip, now_secs, &state.cookie_key);
+    let cookie_valid = verify_challenge_cookie(cookie_str, ip, now_secs, &state.cookie_key);
     debug!("Cookie validation result: {} (IP: {}, Time: {})", cookie_valid, ip, now_secs);
 
-    // Media request check, this is to prevent PoW or the Javascript challenge from taking over the media resources.
-    // All media such a mp3, mp4, etc are cached on most CDNs but this is to fix an issue and also have some measure to defend
-    // against even if there is no caching.  
+    // Media request check
     if !cookie_valid && is_media_request(&req) {
-        let cookie_value = create_challenge_cookie_value(&ip, now_secs, &state.cookie_key);
+        let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
         let mut resp = Response::builder().status(StatusCode::FOUND);
         let set_cookie = format!("Arin={}; Path=/; HttpOnly; SameSite=None; Secure", cookie_value);
         resp = resp.header(header::SET_COOKIE, set_cookie);
@@ -159,7 +155,7 @@ pub async fn handle_request(
         match current_stage {
             0 => {}
             1 => {
-                let cookie_value = create_challenge_cookie_value(&ip, now_secs, &state.cookie_key);
+                let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
                 let forwarded_proto = req
                     .headers()
                     .get("X-Forwarded-Proto")
@@ -176,7 +172,7 @@ pub async fn handle_request(
                 return Ok(resp.header(header::CONTENT_TYPE, "text/html").body(full_body(Bytes::from_static(html.as_bytes()))).unwrap());
             }
             2 => {
-                let cookie_value = create_challenge_cookie_value(&ip, now_secs, &state.cookie_key);
+                let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
                 let forwarded_proto = req
                     .headers()
                     .get("X-Forwarded-Proto")
@@ -255,16 +251,16 @@ pub async fn validate_pow(
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
-        let ip = match parts.headers.get("CF-Connecting-IP").and_then(|h| h.to_str().ok()).map(|s| s.to_string()) {
-            Some(ip) if !ip.is_empty() => ip,
-            _ => {
+        let ip = match parts.headers.get("CF-Connecting-IP").and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<IpAddr>().ok()) {
+            Some(ip) => ip,
+            None => {
                 warn!("Could not determine IP for PoW validation");
                 let resp = Response::builder().status(StatusCode::BAD_REQUEST);
                 return Ok(resp.body(full_body(Bytes::from_static(b"Cannot determine client IP"))).unwrap());
             }
         };
         
-        let cookie_value = create_challenge_cookie_value(&ip, now_secs, &state.cookie_key);
+        let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
         
         info!("PoW validation successful for IP: {}", ip);
         
@@ -366,9 +362,12 @@ async fn proxy_request(
 }
 
 #[inline]
-fn create_challenge_cookie_value(ip: &str, timestamp: u64, key: &[u8; 32]) -> String {
+fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64, key: &[u8; 32]) -> String {
     let mut hasher = blake3::Hasher::new_keyed(key);
-    hasher.update(ip.as_bytes());
+    match ip {
+        IpAddr::V4(addr) => hasher.update(&addr.octets()),
+        IpAddr::V6(addr) => hasher.update(&addr.octets()),
+    }
     hasher.update(&timestamp.to_be_bytes());
     let bytes = hasher.finalize();
     let raw = bytes.as_bytes();
@@ -384,7 +383,7 @@ fn create_challenge_cookie_value(ip: &str, timestamp: u64, key: &[u8; 32]) -> St
 }
 
 #[inline]
-fn verify_challenge_cookie(cookie_str: &str, ip: &str, current_time: u64, key: &[u8; 32]) -> bool {
+fn verify_challenge_cookie(cookie_str: &str, ip: IpAddr, current_time: u64, key: &[u8; 32]) -> bool {
     let provided_opt = cookie_str
         .split(';')
         .find_map(|s| {
@@ -433,9 +432,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[inline]
-fn hash_ip_with_timestamp(ip: &str, timestamp: u64, key: &[u8; 32]) -> String {
+fn hash_ip_with_timestamp(ip: IpAddr, timestamp: u64, key: &[u8; 32]) -> String {
     let mut hasher = blake3::Hasher::new_keyed(key);
-    hasher.update(ip.as_bytes());
+    match ip {
+        IpAddr::V4(addr) => hasher.update(&addr.octets()),
+        IpAddr::V6(addr) => hasher.update(&addr.octets()),
+    }
     hasher.update(&timestamp.to_be_bytes());
     let bytes = hasher.finalize();
     hex_encode(bytes.as_bytes())
@@ -459,13 +461,13 @@ pub async fn get_proxy_stats(
     Ok(resp.body(full_body(Bytes::from(body))).unwrap())
 }
 #[inline]
-fn derive_ip(req: &Request<Incoming>, domain: &str, state: &AppState, fallback: &std::net::SocketAddr) -> Option<String> {
+fn derive_ip<B>(req: &Request<B>, domain: &str, state: &AppState, fallback: &std::net::SocketAddr) -> Option<IpAddr> {
     if let Some(d) = state.domains.get(domain) {
         if d.cloudflare_mode {
-            return req.headers().get("CF-Connecting-IP").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+            return req.headers().get("CF-Connecting-IP").and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<IpAddr>().ok());
         }
     }
-    Some(fallback.ip().to_string())
+    Some(fallback.ip())
 }
 #[inline]
 fn is_hop_req_header(name: &str) -> bool {
@@ -509,7 +511,7 @@ fn ends_with_ignore_ascii_case(hay: &str, suffix: &str) -> bool {
 }
 
 #[inline]
-fn is_media_request(req: &Request<Incoming>) -> bool {
+fn is_media_request<B>(req: &Request<B>) -> bool {
     let headers = req.headers();
 
     if headers.contains_key(header::RANGE) {
@@ -527,12 +529,15 @@ fn is_media_request(req: &Request<Incoming>) -> bool {
     }
 
     if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
-        let a = accept.to_ascii_lowercase();
-        if a.contains("audio/") || a.contains("video/") {
+        // Optimized: avoid to_ascii_lowercase allocation
+        if accept.split(',').any(|part| {
+            let p = part.trim();
+            p.eq_ignore_ascii_case("audio/") || p.starts_with("audio/") ||
+            p.eq_ignore_ascii_case("video/") || p.starts_with("video/") ||
+            p.eq_ignore_ascii_case("application/vnd.apple.mpegurl") ||
+            p.eq_ignore_ascii_case("application/x-mpegurl")
+        }) {
             return true;
-        }
-        if a.contains("application/vnd.apple.mpegurl") || a.contains("application/x-mpegurl") {
-            return true; 
         }
     }
     let path = req.uri().path();

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
+use std::net::IpAddr;
 
 /*
 Use 64K buckets to ensure predictable memory usage and good cache locality.
@@ -35,11 +36,21 @@ impl IPBuckets {
 
     #[inline]
     // FNV-1a hash for speed and locality.
-    pub fn index(&self, ip: &str) -> usize {
+    pub fn index(&self, ip: IpAddr) -> usize {
         let mut h: u64 = 0xcbf29ce484222325;
-        for &b in ip.as_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+        match ip {
+            IpAddr::V4(addr) => {
+                for &b in addr.octets().iter() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            }
+            IpAddr::V6(addr) => {
+                for &b in addr.octets().iter() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            }
         }
         (h as usize) & (self.counts.len() - 1)
     }
@@ -89,7 +100,7 @@ impl AppState {
     }
 
     #[inline]
-    pub fn ip_update_and_get_batched(&self, ip: &str, now_secs: u64, stale_secs: u64) -> u64 {
+    pub fn ip_update_and_get_batched(&self, ip: IpAddr, now_secs: u64, stale_secs: u64) -> u64 {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
         if now_secs.saturating_sub(last) > stale_secs {
@@ -112,7 +123,7 @@ impl AppState {
     }
 
     #[inline]
-    pub fn ip_update_local_batch(&self, ip: &str, now_secs: u64, stale_secs: u64) {
+    pub fn ip_update_local_batch(&self, ip: IpAddr, now_secs: u64, stale_secs: u64) {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
         if now_secs.saturating_sub(last) > stale_secs {
