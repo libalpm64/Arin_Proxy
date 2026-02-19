@@ -1,18 +1,12 @@
-use http_body_util::combinators::BoxBody;
 use bytes::Bytes;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use std::collections::HashMap;
-use log::debug;
-use std::sync::Arc;
+use http_body_util::combinators::BoxBody;
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
-use std::net::IpAddr;
 
-/*
-Use 64K buckets to ensure predictable memory usage and good cache locality.
-This size balances distribution and cache efficiency which is faster in memory.
-*/
 pub const N_IP_BUCKETS: usize = 64 * 1024;
 
 pub struct IPBuckets {
@@ -22,37 +16,42 @@ pub struct IPBuckets {
 
 impl IPBuckets {
     pub fn new(size: usize, init_secs: u64) -> Self {
-        let mut counts_vec: Vec<AtomicU64> = Vec::with_capacity(size);
-        let mut reset_vec: Vec<AtomicU64> = Vec::with_capacity(size);
-        for _ in 0..size {
-            counts_vec.push(AtomicU64::new(0));
-            reset_vec.push(AtomicU64::new(init_secs));
-        }
+        let counts: Box<[AtomicU64]> = (0..size).map(|_| AtomicU64::new(0)).collect();
+        let last_reset_secs: Box<[AtomicU64]> =
+            (0..size).map(|_| AtomicU64::new(init_secs)).collect();
+
         Self {
-            counts: counts_vec.into_boxed_slice(),
-            last_reset_secs: reset_vec.into_boxed_slice(),
+            counts,
+            last_reset_secs,
         }
     }
 
     #[inline]
-    // FNV-1a hash for speed and locality.
     pub fn index(&self, ip: IpAddr) -> usize {
-        let mut h: u64 = 0xcbf29ce484222325;
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut h = FNV_OFFSET;
         match ip {
             IpAddr::V4(addr) => {
-                for &b in addr.octets().iter() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x100000001b3);
-                }
+                let octets = addr.octets();
+                h ^= octets[0] as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+                h ^= octets[1] as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+                h ^= octets[2] as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+                h ^= octets[3] as u64;
+                h = h.wrapping_mul(FNV_PRIME);
             }
             IpAddr::V6(addr) => {
                 for &b in addr.octets().iter() {
                     h ^= b as u64;
-                    h = h.wrapping_mul(0x100000001b3);
+                    h = h.wrapping_mul(FNV_PRIME);
                 }
             }
         }
-        (h as usize) & (self.counts.len() - 1)
+        (h as usize) & (N_IP_BUCKETS - 1)
     }
 
     pub fn cleanup_older_than(&self, now_secs: u64, max_age_secs: u64) {
@@ -70,6 +69,7 @@ pub struct DomainRuntime {
     pub cloudflare_mode: bool,
     pub total_requests: AtomicU64,
     pub bypassed_requests: AtomicU64,
+    #[allow(dead_code)]
     pub blocked_requests: AtomicU64,
     pub last_reset_secs: AtomicU64,
     pub last_pow_success: AtomicU64,
@@ -77,7 +77,7 @@ pub struct DomainRuntime {
 }
 
 pub struct AppState {
-    pub domains: Arc<HashMap<String, Arc<DomainRuntime>>>,
+    pub domains: Arc<std::collections::HashMap<String, Arc<DomainRuntime>>>,
     pub ip_buckets: IPBuckets,
     pub pow_pool: Arc<crate::pow::PowVerifierPool>,
     pub cookie_key: [u8; 32],
@@ -96,13 +96,13 @@ impl AppState {
             .unwrap_or_default()
             .as_secs();
         self.ip_buckets.cleanup_older_than(now_secs, 3600);
-        debug!("Cleaned up old request records");
     }
 
     #[inline]
     pub fn ip_update_and_get_batched(&self, ip: IpAddr, now_secs: u64, stale_secs: u64) -> u64 {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
+
         if now_secs.saturating_sub(last) > stale_secs {
             self.ip_buckets.counts[idx].store(1, Ordering::Relaxed);
             self.ip_buckets.last_reset_secs[idx].store(now_secs, Ordering::Relaxed);
@@ -117,7 +117,9 @@ impl AppState {
                 self.local_ip_acc[idx].store(0, Ordering::Relaxed);
                 total
             } else {
-                self.ip_buckets.counts[idx].load(Ordering::Relaxed).saturating_add(entry)
+                self.ip_buckets.counts[idx]
+                    .load(Ordering::Relaxed)
+                    .saturating_add(entry)
             }
         }
     }
@@ -126,6 +128,7 @@ impl AppState {
     pub fn ip_update_local_batch(&self, ip: IpAddr, now_secs: u64, stale_secs: u64) {
         let idx = self.ip_buckets.index(ip);
         let last = self.ip_buckets.last_reset_secs[idx].load(Ordering::Relaxed);
+
         if now_secs.saturating_sub(last) > stale_secs {
             self.ip_buckets.counts[idx].store(1, Ordering::Relaxed);
             self.ip_buckets.last_reset_secs[idx].store(now_secs, Ordering::Relaxed);

@@ -97,8 +97,6 @@ pub struct RuntimeOpts {
     #[serde(default)]
     pub client_max_concurrency: Option<usize>,
     #[serde(default)]
-    pub client_http2_only: bool,
-    #[serde(default)]
     pub server_max_connections: Option<usize>,
 }
 
