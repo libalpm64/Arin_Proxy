@@ -5,10 +5,8 @@ use bytes::Bytes;
 use tokio::time::sleep;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::sync::atomic::Ordering;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::state::AppState;
 use crate::pow::{POW_DIFFICULTY, generate_challenge_secret, generate_pow_html};
 
 pub const STAGE_THRESHOLD: u64 = 500;
@@ -66,7 +64,6 @@ fn static_body(data: &'static [u8]) -> BoxBody<Bytes, hyper::Error> {
 
 pub async fn handle_request(
     req: Request<Incoming>,
-    state: std::sync::Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     let now_secs = SystemTime::now()
@@ -74,8 +71,8 @@ pub async fn handle_request(
         .unwrap_or_default()
         .as_secs();
 
-    state.global_total_requests.fetch_add(1, Ordering::Relaxed);
-    
+    crate::state::LOCAL_TOTAL.with(|c| c.set(c.get() + 1));
+
     let domain = match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
         Some(h) => h.split(':').next().unwrap_or(h),
         None => return Ok(Response::builder()
@@ -85,14 +82,14 @@ pub async fn handle_request(
     };
     
     if req.method() == hyper::Method::POST && req.uri().path() == "/pow/validate" {
-        return validate_pow(req, state).await;
+        return validate_pow(req).await;
     }
     
     if req.method() == hyper::Method::GET && req.uri().path() == "/proxy/stats" {
-        return get_proxy_stats(state).await;
+        return get_proxy_stats().await;
     }
 
-    let ip = match derive_ip(&req, domain, &state, &remote_addr) {
+    let ip = match derive_ip(&req, domain, &remote_addr) {
         Some(ip) => ip,
         None => return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -100,7 +97,10 @@ pub async fn handle_request(
             .unwrap()),
     };
 
-    let request_count = state.ip_update_and_get_batched(ip, now_secs, IP_ENTRY_STALE_DURATION);
+    let request_count = crate::state::IP_BUCKET_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        (*state).update_and_get(ip, now_secs, IP_ENTRY_STALE_DURATION)
+    });
 
     if request_count >= SOFT_RL_LIMIT {
         let backoff_ms = ((request_count - SOFT_RL_LIMIT) * MAX_BACKOFF_MS)
@@ -121,19 +121,23 @@ pub async fn handle_request(
     }
 
     if ip != remote_addr.ip() {
-        state.ip_update_local_batch(remote_addr.ip(), now_secs, IP_ENTRY_STALE_DURATION);
+        crate::state::IP_BUCKET_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            (*state).update_local_batch(remote_addr.ip(), now_secs, IP_ENTRY_STALE_DURATION);
+        });
     }
 
     let cookie_str = req.headers().get(header::COOKIE)
         .and_then(|c| c.to_str().ok())
         .unwrap_or("");
 
-    let cookie_valid = verify_challenge_cookie(cookie_str, ip, now_secs, &state.cookie_key);
+    let cookie_valid = verify_challenge_cookie(cookie_str, ip, now_secs);
 
     if !cookie_valid && is_media_request(&req) {
-        let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
+        let cookie_value = create_challenge_cookie_value(ip, now_secs);
         let set_cookie = format!("Arin={}; Path=/; HttpOnly; SameSite=None; Secure", cookie_value);
-        state.global_challenged_requests.fetch_add(1, Ordering::Relaxed);
+        
+        crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
         return Ok(Response::builder()
             .status(StatusCode::FOUND)
             .header(header::SET_COOKIE, set_cookie)
@@ -145,41 +149,47 @@ pub async fn handle_request(
     }
 
     let (current_stage, backend_base, request_allowed) = {
-        let Some(d) = state.domains.get(domain) else {
+        let domain_config = crate::state::DOMAIN_CONFIG.with(|configs| {
+            configs.borrow().get(domain).cloned()
+        });
+        
+        let Some(config) = domain_config else {
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(static_body(NOT_FOUND_BODY))
                 .unwrap());
         };
         
-        d.total_requests.fetch_add(1, Ordering::Relaxed);
-        
-        let last = d.last_reset_secs.load(Ordering::Relaxed);
-        if now_secs.saturating_sub(last) >= 1 {
-            if d.bypassed_requests.load(Ordering::Relaxed) >= STAGE_THRESHOLD {
-                let cur = d.stage.load(Ordering::Relaxed);
-                let new = cur.saturating_add(1).min(3);
-                d.stage.store(new, Ordering::Relaxed);
+        crate::state::DOMAIN_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            let d = stats.get_mut(domain).unwrap();
+            
+            d.total_requests += 1;
+            
+            if now_secs.saturating_sub(d.last_reset_secs) >= 1 {
+                if d.bypassed_requests >= STAGE_THRESHOLD {
+                    let new = d.stage.saturating_add(1).min(3);
+                    d.stage = new;
+                }
+                d.bypassed_requests = 0;
+                d.last_reset_secs = now_secs;
             }
-            d.bypassed_requests.store(0, Ordering::Relaxed);
-            d.last_reset_secs.store(now_secs, Ordering::Relaxed);
-        }
-        
-        let stage = d.stage.load(Ordering::Relaxed);
-        let allowed = stage == 0 || cookie_valid;
-        
-        if allowed {
-            d.bypassed_requests.fetch_add(1, Ordering::Relaxed);
-        }
-        
-        (stage, d.backend_base.clone(), allowed)
+            
+            let allowed = d.stage == 0 || cookie_valid;
+            
+            if allowed {
+                d.bypassed_requests += 1;
+            }
+            
+            (d.stage, config.backend_base.clone(), allowed)
+        })
     };
 
     if !cookie_valid {
         match current_stage {
             0 => {}
             1 => {
-                let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
+                let cookie_value = create_challenge_cookie_value(ip, now_secs);
                 let forwarded_proto = req.headers()
                     .get("X-Forwarded-Proto")
                     .and_then(|v| v.to_str().ok())
@@ -189,7 +199,7 @@ pub async fn handle_request(
                 let cookie_suffix = if is_https { "; SameSite=None; Secure" } else { "; SameSite=Lax" };
                 let set_cookie = format!("Arin={}; Path=/; HttpOnly{}", cookie_value, cookie_suffix);
                 
-                state.global_challenged_requests.fetch_add(1, Ordering::Relaxed);
+                crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::SET_COOKIE, set_cookie)
@@ -198,7 +208,7 @@ pub async fn handle_request(
                     .unwrap());
             }
             2 => {
-                let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
+                let cookie_value = create_challenge_cookie_value(ip, now_secs);
                 let forwarded_proto = req.headers()
                     .get("X-Forwarded-Proto")
                     .and_then(|v| v.to_str().ok())
@@ -217,7 +227,7 @@ pub async fn handle_request(
                 js_challenge.push_str(cookie_suffix);
                 js_challenge.push_str("';window.location.reload();</script></head><body></body></html>");
                 
-                state.global_challenged_requests.fetch_add(1, Ordering::Relaxed);
+                crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/html")
@@ -234,7 +244,7 @@ pub async fn handle_request(
                         .unwrap()),
                 };
                 
-                state.global_challenged_requests.fetch_add(1, Ordering::Relaxed);
+                crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/html")
@@ -255,13 +265,12 @@ pub async fn handle_request(
             .unwrap());
     }
     
-    state.global_allowed_requests.fetch_add(1, Ordering::Relaxed);
-    proxy_request(req, &backend_base, &state).await
+    crate::state::LOCAL_ALLOWED.with(|c| c.set(c.get() + 1));
+    proxy_request(req, &backend_base).await
 }
 
 pub async fn validate_pow(
     req: Request<Incoming>,
-    state: std::sync::Arc<AppState>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     let (parts, body) = req.into_parts();
     let whole_body = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
@@ -275,7 +284,11 @@ pub async fn validate_pow(
     };
 
     let difficulty_bits = POW_DIFFICULTY as usize;
-    let verified_rx = state.pow_pool.submit(pow_request.nonce, pow_request.challenge_secret, difficulty_bits);
+    
+    let verified_rx = crate::state::POW_POOL.with(|pool| {
+        pool.borrow().submit(pow_request.nonce, pow_request.challenge_secret, difficulty_bits)
+    });
+    
     let verified = verified_rx.await.unwrap_or(false);
 
     if verified {
@@ -296,7 +309,7 @@ pub async fn validate_pow(
                 .and_then(|s| s.parse::<IpAddr>().ok()))
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         
-        let cookie_value = create_challenge_cookie_value(ip, now_secs, &state.cookie_key);
+        let cookie_value = create_challenge_cookie_value(ip, now_secs);
         let forwarded_proto = parts.headers.get("X-Forwarded-Proto")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("http");
@@ -309,9 +322,12 @@ pub async fn validate_pow(
         
         let set_cookie = format!("Arin={}; Path=/; HttpOnly{}", cookie_value, cookie_suffix);
         
-        if let Some(d) = state.domains.get(domain) {
-            d.last_pow_success.store(now_secs, Ordering::Relaxed);
-        }
+        crate::state::DOMAIN_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            if let Some(d) = stats.get_mut(domain) {
+                d.last_pow_success = now_secs;
+            }
+        });
         
         let resp_body = PowValidationResponse { verified: true };
         return Ok(Response::builder()
@@ -331,10 +347,10 @@ pub async fn validate_pow(
 }
 
 #[inline]
-fn derive_ip(req: &Request<Incoming>, domain: &str, state: &AppState, remote_addr: &SocketAddr) -> Option<IpAddr> {
-    let cf_mode = state.domains.get(domain)
-        .map(|d| d.cloudflare_mode)
-        .unwrap_or(false);
+fn derive_ip(req: &Request<Incoming>, domain: &str, remote_addr: &SocketAddr) -> Option<IpAddr> {
+    let cf_mode = crate::state::DOMAIN_CONFIG.with(|configs| {
+        configs.borrow().get(domain).map(|d| d.cloudflare_mode).unwrap_or(false)
+    });
     
     if cf_mode {
         req.headers().get("CF-Connecting-IP")
@@ -356,7 +372,7 @@ fn is_media_request(req: &Request<Incoming>) -> bool {
 }
 
 #[inline]
-fn verify_challenge_cookie(cookie_str: &str, ip: IpAddr, now_secs: u64, key: &[u8; 32]) -> bool {
+fn verify_challenge_cookie(cookie_str: &str, ip: IpAddr, now_secs: u64) -> bool {
     let arin_value = cookie_str.split(';')
         .map(|s| s.trim())
         .find_map(|s| s.strip_prefix("Arin="));
@@ -374,13 +390,13 @@ fn verify_challenge_cookie(cookie_str: &str, ip: IpAddr, now_secs: u64, key: &[u
         return false;
     }
     
-    let expected = hash_ip_with_timestamp(ip, ts, key);
+    let expected = hash_ip_with_timestamp(ip, ts);
     hash_hex.eq_ignore_ascii_case(&expected)
 }
 
 #[inline]
-fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64, key: &[u8; 32]) -> String {
-    let hash = hash_ip_with_timestamp(ip, timestamp, key);
+fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64) -> String {
+    let hash = hash_ip_with_timestamp(ip, timestamp);
     let ts_str = timestamp.to_string();
     let mut out = String::with_capacity(ts_str.len() + 1 + hash.len());
     out.push_str(&ts_str);
@@ -390,8 +406,9 @@ fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64, key: &[u8; 32]) -> 
 }
 
 #[inline]
-fn hash_ip_with_timestamp(ip: IpAddr, timestamp: u64, key: &[u8; 32]) -> String {
-    let mut hasher = blake3::Hasher::new_keyed(key);
+fn hash_ip_with_timestamp(ip: IpAddr, timestamp: u64) -> String {
+    let key = crate::state::COOKIE_KEY.with(|k| *k.borrow());
+    let mut hasher = blake3::Hasher::new_keyed(&key);
     match ip {
         IpAddr::V4(addr) => { hasher.update(&addr.octets()); }
         IpAddr::V6(addr) => { hasher.update(&addr.octets()); }
@@ -414,9 +431,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub async fn proxy_request(
     req: Request<Incoming>,
     backend_base: &str,
-    state: &AppState,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
-    let _permit = state.backend_sem.acquire().await.map_err(|e| e.to_string())?;
+    let sem = crate::state::BACKEND_SEM.with(|sem| (*sem.borrow()).clone());
+    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
     
     let (parts, body) = req.into_parts();
     let body_bytes = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
@@ -443,7 +460,11 @@ pub async fn proxy_request(
     
     let proxied_req = builder.body(full_body(body_bytes)).map_err(|e| e.to_string())?;
     
-    let response = state.http_client.request(proxied_req).await.map_err(|e| e.to_string())?;
+    let response = crate::state::HTTP_CLIENT.with(|client| {
+        let client = (*client.borrow()).clone().unwrap();
+        client.request(proxied_req)
+    }).await.map_err(|e| e.to_string())?;
+    
     let (parts, body) = response.into_parts();
     let body_bytes = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
     
@@ -456,12 +477,11 @@ pub async fn proxy_request(
 }
 
 pub async fn get_proxy_stats(
-    state: std::sync::Arc<AppState>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     let stats = ProxyStats {
-        total_requests: state.global_total_requests.load(Ordering::Relaxed),
-        challenged_requests: state.global_challenged_requests.load(Ordering::Relaxed),
-        allowed_requests: state.global_allowed_requests.load(Ordering::Relaxed),
+        total_requests: crate::state::GLOBAL_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        challenged_requests: crate::state::GLOBAL_CHALLENGED.load(std::sync::atomic::Ordering::Relaxed),
+        allowed_requests: crate::state::GLOBAL_ALLOWED.load(std::sync::atomic::Ordering::Relaxed),
     };
     
     Ok(Response::builder()
@@ -469,12 +489,4 @@ pub async fn get_proxy_stats(
         .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(serde_json::to_string(&stats).unwrap_or_default())))
         .unwrap())
-}
-
-pub async fn route(
-    req: Request<Incoming>,
-    state: std::sync::Arc<AppState>,
-    remote_addr: SocketAddr,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
-    handle_request(req, state, remote_addr).await
 }

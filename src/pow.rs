@@ -1,21 +1,20 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::cell::Cell;
 use tokio::sync::oneshot;
 
 pub const POW_DIFFICULTY: u32 = 18;
 pub const POW_CHALLENGE_LENGTH: usize = 32;
-static NEXT_SEED: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static NEXT_SEED: Cell<u64> = Cell::new(1);
+}
 
 pub struct PowVerifierPool {
-    _threads: usize,
+    _private: (),
 }
 
 impl PowVerifierPool {
-    pub fn new(num_threads: usize, _pin_threads: bool) -> Arc<Self> {
-        Arc::new(Self {
-            _threads: num_threads.max(1),
-        })
+    pub fn new(_num_threads: usize, _pin_threads: bool) -> Self {
+        Self { _private: () }
     }
 
     pub fn submit(
@@ -25,6 +24,9 @@ impl PowVerifierPool {
         difficulty_bits: usize,
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
+        
+        // Run PoW verification on the blocking pool
+        // (closure runs on a blocking thread)
         tokio::task::spawn_blocking(move || {
             let mut hasher = blake3::Hasher::new();
             hasher.update(nonce.as_bytes());
@@ -51,19 +53,28 @@ impl PowVerifierPool {
                     break;
                 }
             }
+            
+            // tx result through oneshot channel
             let _ = tx.send(ok);
         });
+        
         rx
     }
 }
 
 pub fn generate_challenge_secret() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let seed = NEXT_SEED.fetch_add(1, Ordering::Relaxed);
+    
+    let seed = NEXT_SEED.with(|cell| {
+        let current = cell.get();
+        cell.set(current + 1);
+        current
+    });
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(&now_nanos.to_be_bytes());
