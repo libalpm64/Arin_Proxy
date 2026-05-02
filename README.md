@@ -2,13 +2,11 @@
 
 Arin Proxy is a DDoS-protected reverse proxy designed to run behind CDNs like Cloudflare. It helps prevent bypass attempts that could overwhelm your application. Built using Hyper, Arin Proxy is both fast and feature-rich and optimized for high performance, with various challenges to mitigate HTTP/HTTPS DDoS attacks without taxing the client's backend server.
 
-Arin Proxy's primary goal is to cut costs from HTTP/HTTPS DDoS attacks; the cost for ingress/egress traffic on most services is expensive. This, paired with a hosting such as Hetzner (or any unmetered dedicated server seller) with a 10 GB NIC/Port speed, you can handle up to 400k RPS on 1 server. It isn't CPU-bound; you will likely run out of bandwidth before this proxy uses up your entire system's resources. 
+Arin Proxy's primary goal is to cut costs from HTTP/HTTPS DDoS attacks; the cost for ingress/egress traffic on most services is expensive. This, paired with a hosting such as Hetzner (or any unmetered dedicated server seller) with a 10 GB NIC/Port speed, you can handle up to 400k RPS on 1 server. It isn't compute bound; you will likely run out of bandwidth before this proxy uses up your entire system's resources. 
 
 ## Key Features
 
-- **Multi-threaded:** Arin Proxy makes use of multi-core systems, allowing it to handle increased traffic effectively and very quickly.
-- **Blocks Automated Bots:** Being new, Arin Proxy does not yet have specific signatures for AI scrapers, crawlers, and other automated bots, unintentionally providing protection from such vexations.
-- **Expandable:** Hyper offers numerous load-balancing technologies, with many resources available for implementing multi-server and origin configurations.
+- **Blocks Automated Bots:** Being new, Arin Proxy does not yet have specific signatures for AI scrapers, crawlers, and other automated bots, unintentionally providing protection from vexation.
 
 ## What Does Arin Proxy Do?
 
@@ -21,7 +19,7 @@ Arin Proxy operates through three distinct stages:
 ## Recommendations
 
 - **Run Behind a CDN:** For optimal protection, deploy Arin Proxy behind Cloudflare or another CDN.
-- **Use a Multi-core Server:** Arin Proxy is asynchronous, allowing for multi-threading. More cores will enhance performance.
+- **Use a Multi-core Server:** Arin Proxy is asynchronoius runtime. The more cores, the better load the balancing.
 - **High Bandwidth Server:** For the PoW challenge, a server with high port-speed (10+ Gbps) is recommended to manage the increased data transmission, as each visitor request generates a large response.
 
 - **Only allow traffic from your CDN by whitelisting its IP ranges, or use IPv6, or set up a tunnel (like Cloudflare Tunnel) so no outside service can access your server directly:**
@@ -35,7 +33,7 @@ After getting multiple DDoS attacks, Cloudflare blocked a total of 435 requests 
 <img width="1638" height="514" alt="image" src="https://github.com/user-attachments/assets/91368185-9d52-40fc-85d2-1303f6ac1aa8" />
 
 Arin Proxy effectively eliminates HTTP/HTTPS DDoS attacks when paired with Cloudflare, and only dedicated attacks with large proxy lists + large botnets will be able to take down your website. The stage sensor allows for detecting when attacks are getting through (too many
-requests allowed) In which it will employ a stricter challenge until the PoW (which is effectively impossible to take down unless they overwhelm the proxy itself, they would need hundreds of times the amount of compute needed per 1 request than you).
+requests allowed) In which it will employ a stricter challenge until the PoW (which is difficullt to take down because they need to overwhelm the proxy itself which would require hundreds of times the amount of compute needed per 1 request that you serve).
 
 **Bandwidth Usage:**  
 Our PoW challenge is only **2 KB**, which is way smaller than most other services. We use **JSDelivr** to serve the static challenge assets, so your server doesn’t have to—this helps avoid saturating your port. On a **1 Gbps port**, you can handle **~45k RPS** just from the PoW stage.
