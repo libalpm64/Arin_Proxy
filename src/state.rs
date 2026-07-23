@@ -4,7 +4,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ thread_local! {
     pub static POW_POOL: RefCell<crate::pow::PowVerifierPool> = RefCell::new(crate::pow::PowVerifierPool::new(1, false));
     pub static COOKIE_KEY: RefCell<[u8; 32]> = RefCell::new([0u8; 32]);
     pub static HTTP_CLIENT: RefCell<Option<Client<HttpConnector, BoxBody<Bytes, hyper::Error>>>> = RefCell::new(None);
-    pub static BACKEND_SEM: RefCell<Rc<tokio::sync::Semaphore>> = RefCell::new(Rc::new(tokio::sync::Semaphore::new(512)));
+    pub static BACKEND_SEM: RefCell<Arc<tokio::sync::Semaphore>> = RefCell::new(Arc::new(tokio::sync::Semaphore::new(512)));
     pub static LOCAL_TOTAL: std::cell::Cell<u64> = std::cell::Cell::new(0);
     pub static LOCAL_CHALLENGED: std::cell::Cell<u64> = std::cell::Cell::new(0);
     pub static LOCAL_ALLOWED: std::cell::Cell<u64> = std::cell::Cell::new(0);
@@ -165,7 +165,7 @@ pub fn init_core_state(
     POW_POOL.with(|state| *state.borrow_mut() = pow_pool);
     COOKIE_KEY.with(|state| *state.borrow_mut() = cookie_key);
     HTTP_CLIENT.with(|state| *state.borrow_mut() = Some(http_client));
-    BACKEND_SEM.with(|state| *state.borrow_mut() = Rc::new(backend_sem));
+    BACKEND_SEM.with(|state| *state.borrow_mut() = Arc::new(backend_sem));
 }
 
 pub fn cleanup_old_requests() {
