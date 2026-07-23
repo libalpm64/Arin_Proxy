@@ -14,7 +14,11 @@ Arin Proxy operates through three distinct stages:
 
 1. **Standard Cookie Challenge:** A simple challenge that sets a cookie in the header.
 2. **JavaScript Challenge:** Ensures the client browser has JavaScript enabled, blocking a majority of headless browsers.
-3. **Proof of Work (PoW) Challenge:** Creates CPU-intensive tasks that deter attackers by requiring them to solve complex computational hashes. This stage demands significant server resources and operates with multiple workers.
+3. **Sequential VDF Challenge:** Forces clients to complete sequential work that cannot be accelerated with more CPU cores, GPUs, or parallel workers.
+
+## VDF Tradeoffs
+
+The VDF approach is slower than BLAKE3, but its sequential-only work makes it the better hardened option for threats such as web scraping. For large-scale DDoS protection where maximum server throughput matters, the BLAKE3 approach on the main branch is the better option.
 
 ## Recommendations
 
