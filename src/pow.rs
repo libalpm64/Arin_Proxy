@@ -1,161 +1,101 @@
-use rand::{RngCore, rngs::OsRng};
-use rsa::{BigUint, RsaPrivateKey, traits::{PrivateKeyParts, PublicKeyParts}};
-use std::{collections::VecDeque, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
+use std::cell::Cell;
 use tokio::sync::oneshot;
 
-pub const POW_DIFFICULTY: u64 = 300_000;
-const WIDTH: usize = 256;
-const MAX_PENDING: usize = 32_768;
+pub const POW_DIFFICULTY: u32 = 18;
+pub const POW_CHALLENGE_LENGTH: usize = 32;
 
-pub struct BrowserChallenge {
-    pub modulus: String,
-    pub base: String,
-    pub difficulty: u64,
+thread_local! {
+    static NEXT_SEED: Cell<u64> = Cell::new(1);
 }
 
-struct Params {
-    modulus: BigUint,
-    exponent: BigUint,
+pub struct PowVerifierPool {
+    _private: (),
 }
-
-struct Pending {
-    answer: [u8; WIDTH],
-    expires: Instant,
-}
-
-static PARAMS: OnceLock<Params> = OnceLock::new();
-static PENDING: OnceLock<Mutex<VecDeque<Pending>>> = OnceLock::new();
-
-fn params() -> &'static Params {
-    PARAMS.get_or_init(|| Params::generate(2048, POW_DIFFICULTY))
-}
-
-fn pending() -> &'static Mutex<VecDeque<Pending>> {
-    PENDING.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_PENDING)))
-}
-
-impl Params {
-    fn generate(bits: usize, difficulty: u64) -> Self {
-        let key = RsaPrivateKey::new(&mut OsRng, bits).expect("RSA key generation failed");
-        let one = BigUint::from(1u8);
-        let phi = (key.primes()[0].clone() - &one) * (key.primes()[1].clone() - &one);
-        let exponent = BigUint::from(2u8).modpow(&BigUint::from(difficulty), &phi);
-        Self { modulus: key.n().clone(), exponent }
-    }
-
-    fn issue(&self, difficulty: u64) -> (BrowserChallenge, [u8; WIDTH]) {
-        let base = loop {
-            let mut bytes = [0u8; WIDTH];
-            OsRng.fill_bytes(&mut bytes);
-            let value = BigUint::from_bytes_be(&bytes) % (&self.modulus - BigUint::from(3u8)) + BigUint::from(2u8);
-            if gcd(value.clone(), self.modulus.clone()) == BigUint::from(1u8) { break value; }
-        };
-        let answer = fixed(&base.modpow(&self.exponent, &self.modulus).to_bytes_be());
-        (BrowserChallenge {
-            modulus: encode(&fixed(&self.modulus.to_bytes_be())),
-            base: encode(&fixed(&base.to_bytes_be())),
-            difficulty,
-        }, answer)
-    }
-}
-
-fn gcd(mut left: BigUint, mut right: BigUint) -> BigUint {
-    while right != BigUint::from(0u8) {
-        let remainder = &left % &right;
-        left = right;
-        right = remainder;
-    }
-    left
-}
-
-fn fixed(bytes: &[u8]) -> [u8; WIDTH] {
-    let mut out = [0u8; WIDTH];
-    out[WIDTH - bytes.len()..].copy_from_slice(bytes);
-    out
-}
-
-fn encode(bytes: &[u8; WIDTH]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(WIDTH * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 15) as usize] as char);
-    }
-    out
-}
-
-fn decode(value: &str) -> Option<[u8; WIDTH]> {
-    if value.len() != WIDTH * 2 { return None; }
-    let mut out = [0u8; WIDTH];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        out[index] = digit(pair[0])? << 4 | digit(pair[1])?;
-    }
-    Some(out)
-}
-
-fn digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-pub struct PowVerifierPool;
 
 impl PowVerifierPool {
     pub fn new(_num_threads: usize, _pin_threads: bool) -> Self {
-        let _ = params();
-        Self
+        Self { _private: () }
     }
 
-    pub fn issue(&self) -> BrowserChallenge {
-        let (challenge, answer) = params().issue(POW_DIFFICULTY);
-        let mut queue = pending().lock().unwrap_or_else(|error| error.into_inner());
-        let now = Instant::now();
-        while queue.front().is_some_and(|item| item.expires <= now) { queue.pop_front(); }
-        if queue.len() == MAX_PENDING { queue.pop_front(); }
-        queue.push_back(Pending { answer, expires: now + Duration::from_secs(300) });
-        challenge
-    }
-
-    pub fn submit(&self, answer: String) -> oneshot::Receiver<bool> {
-        let (sender, receiver) = oneshot::channel();
+    pub fn submit(
+        &self,
+        nonce: String,
+        challenge_secret: String,
+        difficulty_bits: usize,
+    ) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        
+        // Run PoW verification on the blocking pool
+        // (closure runs on a blocking thread)
         tokio::task::spawn_blocking(move || {
-            let verified = decode(&answer).is_some_and(|answer| {
-                let mut queue = pending().lock().unwrap_or_else(|error| error.into_inner());
-                let now = Instant::now();
-                queue.retain(|item| item.expires > now);
-                queue.iter().position(|item| item.answer == answer).is_some_and(|index| queue.remove(index).is_some())
-            });
-            let _ = sender.send(verified);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(nonce.as_bytes());
+            hasher.update(challenge_secret.as_bytes());
+            let hash_bytes = *hasher.finalize().as_bytes();
+
+            let mut bits_to_check = difficulty_bits;
+            let mut ok = true;
+            for &b in hash_bytes.iter() {
+                if bits_to_check >= 8 {
+                    if b != 0 {
+                        ok = false;
+                        break;
+                    }
+                    bits_to_check -= 8;
+                } else {
+                    if bits_to_check == 0 {
+                        break;
+                    }
+                    let mask: u8 = 0xFF << (8 - bits_to_check);
+                    if b & mask != 0 {
+                        ok = false;
+                    }
+                    break;
+                }
+            }
+            
+            // tx result through oneshot channel
+            let _ = tx.send(ok);
         });
-        receiver
+        
+        rx
     }
 }
 
-pub fn generate_pow_html(challenge: &BrowserChallenge) -> Result<String, Box<dyn std::error::Error>> {
-    let html = include_str!("pow_challenge.html")
-        .replace("{modulus}", &challenge.modulus)
-        .replace("{base}", &challenge.base)
-        .replace("{difficulty}", &challenge.difficulty.to_string());
-    if html.len() > 2048 { return Err("challenge exceeds 2 KB".into()); }
-    Ok(html)
+pub fn generate_challenge_secret() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    
+    let seed = NEXT_SEED.with(|cell| {
+        let current = cell.get();
+        cell.set(current + 1);
+        current
+    });
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&now_nanos.to_be_bytes());
+    hasher.update(&seed.to_be_bytes());
+    let bytes = hasher.finalize();
+    let raw = bytes.as_bytes();
+
+    let mut out = String::with_capacity(POW_CHALLENGE_LENGTH);
+    for i in 0..POW_CHALLENGE_LENGTH {
+        let idx = raw[i % raw.len()] as usize % CHARSET.len();
+        out.push(CHARSET[idx] as char);
+    }
+    out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shortcut_matches_sequential_solution() {
-        let difficulty = 32;
-        let params = Params::generate(1024, difficulty);
-        let (challenge, expected) = params.issue(difficulty);
-        let modulus = BigUint::parse_bytes(challenge.modulus.as_bytes(), 16).unwrap();
-        let mut answer = BigUint::parse_bytes(challenge.base.as_bytes(), 16).unwrap();
-        for _ in 0..difficulty { answer = (&answer * &answer) % &modulus; }
-        assert_eq!(fixed(&answer.to_bytes_be()), expected);
-    }
+pub fn generate_pow_html(
+    challenge_secret: &str,
+    difficulty: u32,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let html = include_str!("pow_challenge.html");
+    Ok(html
+        .replace("{challenge_secret}", challenge_secret)
+        .replace("{difficulty}", &difficulty.to_string()))
 }

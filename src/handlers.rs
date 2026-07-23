@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::pow::generate_pow_html;
+use crate::pow::{POW_DIFFICULTY, generate_challenge_secret, generate_pow_html};
 
 pub const STAGE_THRESHOLD: u64 = 500;
 pub const IP_ENTRY_STALE_DURATION: u64 = 60;
@@ -30,7 +30,8 @@ const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Deserialize)]
 pub struct PowValidationRequest {
-    pub answer: String,
+    pub nonce: String,
+    pub challenge_secret: String,
 }
 
 #[derive(Serialize)]
@@ -234,8 +235,8 @@ pub async fn handle_request(
                     .unwrap());
             }
             3 => {
-                let challenge = crate::state::POW_POOL.with(|pool| pool.borrow().issue());
-                let pow_html = match generate_pow_html(&challenge) {
+                let challenge_secret = generate_challenge_secret();
+                let pow_html = match generate_pow_html(&challenge_secret, POW_DIFFICULTY) {
                     Ok(html) => html,
                     Err(_) => return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -282,8 +283,10 @@ pub async fn validate_pow(
             .unwrap()),
     };
 
+    let difficulty_bits = POW_DIFFICULTY as usize;
+    
     let verified_rx = crate::state::POW_POOL.with(|pool| {
-        pool.borrow().submit(pow_request.answer)
+        pool.borrow().submit(pow_request.nonce, pow_request.challenge_secret, difficulty_bits)
     });
     
     let verified = verified_rx.await.unwrap_or(false);

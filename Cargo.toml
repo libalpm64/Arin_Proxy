@@ -15,8 +15,6 @@ socket2 = { version = "0.6", default-features = false, features = ["all"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 crossbeam-channel = "0.5"
 num_cpus = "1.16"
-rsa = { version = "0.9", default-features = false, features = ["std"] }
-rand = "0.8"
 
 [profile.release]
 opt-level = 3
