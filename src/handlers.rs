@@ -15,6 +15,7 @@ pub const SOFT_RL_LIMIT: u64 = 800;
 pub const HARD_RL_LIMIT: u64 = 1000;
 pub const MAX_BACKOFF_MS: u64 = 200;
 pub const CHALLENGE_TTL_SECS: u64 = 300;
+pub const JS_CHALLENGE_TTL_SECS: u64 = 30;
 
 static BAD_REQUEST_BODY: &[u8] = b"Invalid domain";
 static IP_ERROR_BODY: &[u8] = b"Cannot determine client IP";
@@ -23,6 +24,7 @@ static NOT_FOUND_BODY: &[u8] = b"Domain not configured";
 static CHALLENGE_ERROR_BODY: &[u8] = b"Failed to generate challenge";
 static BLOCKED_BODY: &[u8] = b"Request blocked";
 static INVALID_POW_BODY: &[u8] = b"Invalid POW validation request";
+static INVALID_JS_BODY: &[u8] = b"Invalid JS validation request";
 
 static STAGE1_HTML: &[u8] = b"<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0\"></head><body></body></html>";
 
@@ -31,6 +33,11 @@ const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 #[derive(Deserialize)]
 pub struct PowValidationRequest {
     pub answer: String,
+}
+
+#[derive(Deserialize)]
+pub struct JsValidationRequest {
+    pub token: String,
 }
 
 #[derive(Serialize)]
@@ -82,6 +89,17 @@ pub async fn handle_request(
     
     if req.method() == hyper::Method::POST && req.uri().path() == "/pow/validate" {
         return validate_pow(req).await;
+    }
+
+    if req.method() == hyper::Method::POST && req.uri().path() == "/js/validate" {
+        let ip = match derive_ip(&req, domain, &remote_addr) {
+            Some(ip) => ip,
+            None => return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(static_body(IP_ERROR_BODY))
+                .unwrap()),
+        };
+        return validate_js(req, ip).await;
     }
     
     if req.method() == hyper::Method::GET && req.uri().path() == "/proxy/stats" {
@@ -207,24 +225,11 @@ pub async fn handle_request(
                     .unwrap());
             }
             2 => {
-                let cookie_value = create_challenge_cookie_value(ip, now_secs);
-                let forwarded_proto = req.headers()
-                    .get("X-Forwarded-Proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("http");
-                
-                let cookie_suffix = if forwarded_proto.eq_ignore_ascii_case("https") { 
-                    "; SameSite=None; Secure" 
-                } else { 
-                    "; SameSite=Lax" 
-                };
-                
-                let mut js_challenge = String::with_capacity(200);
-                js_challenge.push_str("<!DOCTYPE html><html><head><script>document.cookie='Arin=");
-                js_challenge.push_str(&cookie_value);
-                js_challenge.push_str("; Path=/");
-                js_challenge.push_str(cookie_suffix);
-                js_challenge.push_str("';window.location.reload();</script></head><body></body></html>");
+                let token = create_js_challenge_token(ip, now_secs);
+                let mut js_challenge = String::with_capacity(300);
+                js_challenge.push_str("<!doctype html><html style=background:#121212><script type=module>import{run}from'https://cdn.jsdelivr.net/gh/libalpm64/Blake3-JS@4fdbc61b1ae09d6313af3c0805fca49754ff0884/arin-browser.js';run('");
+                js_challenge.push_str(&token);
+                js_challenge.push_str("')</script>");
                 
                 crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
                 return Ok(Response::builder()
@@ -266,6 +271,47 @@ pub async fn handle_request(
     
     crate::state::LOCAL_ALLOWED.with(|c| c.set(c.get() + 1));
     proxy_request(req, &backend_base).await
+}
+
+pub async fn validate_js(
+    req: Request<Incoming>,
+    ip: IpAddr,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    let (parts, body) = req.into_parts();
+    let whole_body = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
+    let js_request: JsValidationRequest = match serde_json::from_slice(&whole_body) {
+        Ok(request) => request,
+        Err(_) => return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(static_body(INVALID_JS_BODY))
+            .unwrap()),
+    };
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let verified = verify_js_challenge_token(&js_request.token, ip, now_secs);
+    let resp_body = PowValidationResponse { verified };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store");
+    if verified {
+        let cookie_value = create_challenge_cookie_value(ip, now_secs);
+        let forwarded_proto = parts.headers.get("X-Forwarded-Proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+        let cookie_suffix = if forwarded_proto.eq_ignore_ascii_case("https") {
+            "; SameSite=None; Secure"
+        } else {
+            "; SameSite=Lax"
+        };
+        let set_cookie = format!("Arin={}; Path=/; HttpOnly{}", cookie_value, cookie_suffix);
+        response = response.header(header::SET_COOKIE, set_cookie);
+    }
+    Ok(response
+        .body(full_body(Bytes::from(serde_json::to_string(&resp_body).unwrap_or_default())))
+        .unwrap())
 }
 
 pub async fn validate_pow(
@@ -400,6 +446,41 @@ fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64) -> String {
     out.push(':');
     out.push_str(&hash);
     out
+}
+
+#[inline]
+fn create_js_challenge_token(ip: IpAddr, timestamp: u64) -> String {
+    let hash = hash_js_challenge(ip, timestamp);
+    let ts_str = timestamp.to_string();
+    let mut out = String::with_capacity(ts_str.len() + 1 + hash.len());
+    out.push_str(&ts_str);
+    out.push(':');
+    out.push_str(&hash);
+    out
+}
+
+#[inline]
+fn verify_js_challenge_token(token: &str, ip: IpAddr, now_secs: u64) -> bool {
+    let Some((ts_str, hash_hex)) = token.split_once(':') else { return false };
+    let Ok(timestamp) = ts_str.parse::<u64>() else { return false };
+    if timestamp > now_secs || now_secs.saturating_sub(timestamp) > JS_CHALLENGE_TTL_SECS {
+        return false;
+    }
+    hash_hex.eq_ignore_ascii_case(&hash_js_challenge(ip, timestamp))
+}
+
+#[inline]
+fn hash_js_challenge(ip: IpAddr, timestamp: u64) -> String {
+    let key = crate::state::COOKIE_KEY.with(|k| *k.borrow());
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    hasher.update(b"arin-browser-stage-2");
+    match ip {
+        IpAddr::V4(addr) => { hasher.update(&addr.octets()); }
+        IpAddr::V6(addr) => { hasher.update(&addr.octets()); }
+    }
+    hasher.update(&timestamp.to_be_bytes());
+    let bytes = hasher.finalize();
+    hex_encode(bytes.as_bytes())
 }
 
 #[inline]
