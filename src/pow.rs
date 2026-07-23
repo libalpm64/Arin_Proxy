@@ -1,6 +1,6 @@
 use rand::{RngCore, rngs::OsRng};
 use rsa::{BigUint, RsaPrivateKey, traits::{PrivateKeyParts, PublicKeyParts}};
-use std::{collections::VecDeque, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
+use std::{collections::VecDeque, net::IpAddr, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
 use tokio::sync::oneshot;
 
 pub const POW_DIFFICULTY: u64 = 300_000;
@@ -20,6 +20,8 @@ struct Params {
 
 struct Pending {
     answer: [u8; WIDTH],
+    ip: IpAddr,
+    domain: String,
     expires: Instant,
 }
 
@@ -110,24 +112,26 @@ impl PowVerifierPool {
         Self
     }
 
-    pub fn issue(&self) -> BrowserChallenge {
+    pub fn issue(&self, ip: IpAddr, domain: String) -> BrowserChallenge {
         let (challenge, answer) = params().issue(POW_DIFFICULTY);
         let mut queue = pending().lock().unwrap_or_else(|error| error.into_inner());
         let now = Instant::now();
         while queue.front().is_some_and(|item| item.expires <= now) { queue.pop_front(); }
         if queue.len() == MAX_PENDING { queue.pop_front(); }
-        queue.push_back(Pending { answer, expires: now + Duration::from_secs(300) });
+        queue.push_back(Pending { answer, ip, domain, expires: now + Duration::from_secs(300) });
         challenge
     }
 
-    pub fn submit(&self, answer: String) -> oneshot::Receiver<bool> {
+    pub fn submit(&self, answer: String, ip: IpAddr, domain: String) -> oneshot::Receiver<bool> {
         let (sender, receiver) = oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let verified = decode(&answer).is_some_and(|answer| {
                 let mut queue = pending().lock().unwrap_or_else(|error| error.into_inner());
                 let now = Instant::now();
                 queue.retain(|item| item.expires > now);
-                queue.iter().position(|item| item.answer == answer).is_some_and(|index| queue.remove(index).is_some())
+                queue.iter().position(|item| {
+                    item.answer == answer && item.ip == ip && item.domain == domain
+                }).is_some_and(|index| queue.remove(index).is_some())
             });
             let _ = sender.send(verified);
         });
@@ -157,5 +161,23 @@ mod tests {
         let mut answer = BigUint::parse_bytes(challenge.base.as_bytes(), 16).unwrap();
         for _ in 0..difficulty { answer = (&answer * &answer) % &modulus; }
         assert_eq!(fixed(&answer.to_bytes_be()), expected);
+    }
+
+    #[tokio::test]
+    async fn answer_is_bound_and_single_use() {
+        let answer = [173u8; WIDTH];
+        let encoded = encode(&answer);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        pending().lock().unwrap().push_back(Pending {
+            answer,
+            ip,
+            domain: "example.com".to_owned(),
+            expires: Instant::now() + Duration::from_secs(30),
+        });
+        let pool = PowVerifierPool;
+        assert!(!pool.submit(encoded.clone(), "192.0.2.2".parse().unwrap(), "example.com".to_owned()).await.unwrap());
+        assert!(!pool.submit(encoded.clone(), ip, "other.example".to_owned()).await.unwrap());
+        assert!(pool.submit(encoded.clone(), ip, "example.com".to_owned()).await.unwrap());
+        assert!(!pool.submit(encoded, ip, "example.com".to_owned()).await.unwrap());
     }
 }

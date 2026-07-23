@@ -1,6 +1,6 @@
 use hyper::{Request, Response, StatusCode, header};
 use hyper::body::Incoming;
-use http_body_util::{Full, BodyExt, combinators::BoxBody};
+use http_body_util::{Full, BodyExt, Limited, combinators::BoxBody};
 use bytes::Bytes;
 use tokio::time::sleep;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,8 @@ pub const HARD_RL_LIMIT: u64 = 1000;
 pub const MAX_BACKOFF_MS: u64 = 200;
 pub const CHALLENGE_TTL_SECS: u64 = 300;
 pub const JS_CHALLENGE_TTL_SECS: u64 = 30;
+pub const MAX_JS_BODY: usize = 512;
+pub const MAX_POW_BODY: usize = 1024;
 
 static BAD_REQUEST_BODY: &[u8] = b"Invalid domain";
 static IP_ERROR_BODY: &[u8] = b"Cannot determine client IP";
@@ -25,6 +27,7 @@ static CHALLENGE_ERROR_BODY: &[u8] = b"Failed to generate challenge";
 static BLOCKED_BODY: &[u8] = b"Request blocked";
 static INVALID_POW_BODY: &[u8] = b"Invalid POW validation request";
 static INVALID_JS_BODY: &[u8] = b"Invalid JS validation request";
+static PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload too large";
 
 static STAGE1_HTML: &[u8] = b"<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0\"></head><body></body></html>";
 
@@ -38,6 +41,7 @@ pub struct PowValidationRequest {
 #[derive(Deserialize)]
 pub struct JsValidationRequest {
     pub token: String,
+    pub nonce: u32,
 }
 
 #[derive(Serialize)]
@@ -88,7 +92,15 @@ pub async fn handle_request(
     };
     
     if req.method() == hyper::Method::POST && req.uri().path() == "/pow/validate" {
-        return validate_pow(req).await;
+        let ip = match derive_ip(&req, domain, &remote_addr) {
+            Some(ip) => ip,
+            None => return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(static_body(IP_ERROR_BODY))
+                .unwrap()),
+        };
+        let domain = domain.to_owned();
+        return validate_pow(req, ip, domain).await;
     }
 
     if req.method() == hyper::Method::POST && req.uri().path() == "/js/validate" {
@@ -150,17 +162,11 @@ pub async fn handle_request(
 
     let cookie_valid = verify_challenge_cookie(cookie_str, ip, now_secs);
 
-    if !cookie_valid && is_media_request(&req) {
-        let cookie_value = create_challenge_cookie_value(ip, now_secs);
-        let set_cookie = format!("Arin={}; Path=/; HttpOnly; SameSite=None; Secure", cookie_value);
-        
+    if !cookie_valid && is_subresource_request(&req) {
         crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
         return Ok(Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::SET_COOKIE, set_cookie)
-            .header(header::LOCATION, req.uri().to_string())
+            .status(StatusCode::FORBIDDEN)
             .header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")
-            .header(header::PRAGMA, "no-cache")
             .body(empty_body())
             .unwrap());
     }
@@ -227,7 +233,7 @@ pub async fn handle_request(
             2 => {
                 let token = create_js_challenge_token(ip, now_secs);
                 let mut js_challenge = String::with_capacity(300);
-                js_challenge.push_str("<!doctype html><html style=background:#121212><script type=module>import{run}from'https://cdn.jsdelivr.net/gh/libalpm64/Blake3-JS@4fdbc61b1ae09d6313af3c0805fca49754ff0884/arin-browser.js';run('");
+                js_challenge.push_str("<!doctype html><html style=background:#121212><script type=module>import{run}from'https://cdn.jsdelivr.net/gh/libalpm64/Blake3-JS@edd695e564ebdbced1e9036193ca4afc3f0c7a01/arin-browser.js';run('");
                 js_challenge.push_str(&token);
                 js_challenge.push_str("')</script>");
                 
@@ -239,7 +245,9 @@ pub async fn handle_request(
                     .unwrap());
             }
             3 => {
-                let challenge = crate::state::POW_POOL.with(|pool| pool.borrow().issue());
+                let challenge = crate::state::POW_POOL.with(|pool| {
+                    pool.borrow().issue(ip, domain.to_owned())
+                });
                 let pow_html = match generate_pow_html(&challenge) {
                     Ok(html) => html,
                     Err(_) => return Ok(Response::builder()
@@ -277,8 +285,20 @@ pub async fn validate_js(
     req: Request<Incoming>,
     ip: IpAddr,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    if content_length_exceeds(&req, MAX_JS_BODY) {
+        return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(static_body(PAYLOAD_TOO_LARGE_BODY))
+            .unwrap());
+    }
     let (parts, body) = req.into_parts();
-    let whole_body = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
+    let whole_body = match Limited::new(body, MAX_JS_BODY).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(static_body(PAYLOAD_TOO_LARGE_BODY))
+            .unwrap()),
+    };
     let js_request: JsValidationRequest = match serde_json::from_slice(&whole_body) {
         Ok(request) => request,
         Err(_) => return Ok(Response::builder()
@@ -290,7 +310,8 @@ pub async fn validate_js(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let verified = verify_js_challenge_token(&js_request.token, ip, now_secs);
+    let verified = verify_js_challenge_token(&js_request.token, ip, now_secs)
+        && verify_js_proof(&js_request.token, js_request.nonce);
     let resp_body = PowValidationResponse { verified };
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -316,9 +337,23 @@ pub async fn validate_js(
 
 pub async fn validate_pow(
     req: Request<Incoming>,
+    ip: IpAddr,
+    domain: String,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    if content_length_exceeds(&req, MAX_POW_BODY) {
+        return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(static_body(PAYLOAD_TOO_LARGE_BODY))
+            .unwrap());
+    }
     let (parts, body) = req.into_parts();
-    let whole_body = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
+    let whole_body = match Limited::new(body, MAX_POW_BODY).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(static_body(PAYLOAD_TOO_LARGE_BODY))
+            .unwrap()),
+    };
     
     let pow_request: PowValidationRequest = match serde_json::from_slice(&whole_body) {
         Ok(request) => request,
@@ -328,30 +363,17 @@ pub async fn validate_pow(
             .unwrap()),
     };
 
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let verified_rx = crate::state::POW_POOL.with(|pool| {
-        pool.borrow().submit(pow_request.answer)
+        pool.borrow().submit(pow_request.answer, ip, domain.clone())
     });
     
     let verified = verified_rx.await.unwrap_or(false);
 
     if verified {
-        let domain = parts.headers.get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-        
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let ip = parts.headers.get("CF-Connecting-IP")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<IpAddr>().ok())
-            .or_else(|| parts.headers.get("X-Real-IP")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<IpAddr>().ok()))
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        
         let cookie_value = create_challenge_cookie_value(ip, now_secs);
         let forwarded_proto = parts.headers.get("X-Forwarded-Proto")
             .and_then(|v| v.to_str().ok())
@@ -367,7 +389,7 @@ pub async fn validate_pow(
         
         crate::state::DOMAIN_STATS.with(|stats| {
             let mut stats = stats.borrow_mut();
-            if let Some(d) = stats.get_mut(domain) {
+            if let Some(d) = stats.get_mut(&domain) {
                 d.last_pow_success = now_secs;
             }
         });
@@ -408,10 +430,25 @@ fn derive_ip(req: &Request<Incoming>, domain: &str, remote_addr: &SocketAddr) ->
 }
 
 #[inline]
-fn is_media_request(req: &Request<Incoming>) -> bool {
+fn is_subresource_request<B>(req: &Request<B>) -> bool {
+    if let Some(destination) = req.headers()
+        .get("Sec-Fetch-Dest")
+        .and_then(|value| value.to_str().ok())
+    {
+        return destination != "document";
+    }
     let path = req.uri().path();
     let ext = path.rsplit('.').next().unwrap_or("");
     matches!(ext, "css" | "js" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "woff" | "woff2" | "ttf" | "eot" | "webp" | "mp4" | "webm" | "mp3" | "ogg")
+}
+
+#[inline]
+fn content_length_exceeds<B>(req: &Request<B>, limit: usize) -> bool {
+    req.headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > limit)
 }
 
 #[inline]
@@ -470,6 +507,19 @@ fn verify_js_challenge_token(token: &str, ip: IpAddr, now_secs: u64) -> bool {
 }
 
 #[inline]
+fn verify_js_proof(token: &str, nonce: u32) -> bool {
+    if nonce > 10_000_000 {
+        return false;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(token.as_bytes());
+    hasher.update(b":");
+    hasher.update(nonce.to_string().as_bytes());
+    let bytes = hasher.finalize();
+    bytes.as_bytes()[0] == 0 && bytes.as_bytes()[1] & 0xF0 == 0
+}
+
+#[inline]
 fn hash_js_challenge(ip: IpAddr, timestamp: u64) -> String {
     let key = crate::state::COOKIE_KEY.with(|k| *k.borrow());
     let mut hasher = blake3::Hasher::new_keyed(&key);
@@ -511,10 +561,9 @@ pub async fn proxy_request(
     backend_base: &str,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     let sem = crate::state::BACKEND_SEM.with(|sem| (*sem.borrow()).clone());
-    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+    let permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
     
     let (parts, body) = req.into_parts();
-    let body_bytes = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
     
     let path_query = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let uri_str = format!("{}{}", backend_base, path_query);
@@ -536,7 +585,7 @@ pub async fn proxy_request(
         }
     }
     
-    let proxied_req = builder.body(full_body(body_bytes)).map_err(|e| e.to_string())?;
+    let proxied_req = builder.body(body.boxed()).map_err(|e| e.to_string())?;
     
     let response = crate::state::HTTP_CLIENT.with(|client| {
         let client = (*client.borrow()).clone().unwrap();
@@ -544,14 +593,11 @@ pub async fn proxy_request(
     }).await.map_err(|e| e.to_string())?;
     
     let (parts, body) = response.into_parts();
-    let body_bytes = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
-    
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        builder = builder.header(name, value);
-    }
-    
-    Ok(builder.body(full_body(body_bytes)).map_err(|e| e.to_string())?)
+    let body = body.map_frame(move |frame| {
+        let _ = &permit;
+        frame
+    }).boxed();
+    Ok(Response::from_parts(parts, body))
 }
 
 pub async fn get_proxy_stats(
@@ -567,4 +613,36 @@ pub async fn get_proxy_stats(
         .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(serde_json::to_string(&stats).unwrap_or_default())))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_proof_matches_cdn_algorithm() {
+        assert!(verify_js_proof("test", 95));
+        assert!(!verify_js_proof("test", 94));
+    }
+
+    #[test]
+    fn subresources_never_receive_challenges() {
+        let image = Request::builder()
+            .header("Sec-Fetch-Dest", "image")
+            .uri("/anything")
+            .body(())
+            .unwrap();
+        let document = Request::builder()
+            .header("Sec-Fetch-Dest", "document")
+            .uri("/anything.png")
+            .body(())
+            .unwrap();
+        let legacy_asset = Request::builder()
+            .uri("/anything.png")
+            .body(())
+            .unwrap();
+        assert!(is_subresource_request(&image));
+        assert!(!is_subresource_request(&document));
+        assert!(is_subresource_request(&legacy_asset));
+    }
 }
