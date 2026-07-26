@@ -53,7 +53,7 @@ impl DomainCoreStats {
             bypassed_requests: 0,
             last_reset_secs: now_secs,
             last_pow_success: 0,
-            stage,
+            stage: stage.min(4),
         }
     }
 }

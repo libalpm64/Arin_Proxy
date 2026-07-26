@@ -36,8 +36,9 @@ const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Deserialize)]
 pub struct PowValidationRequest {
-    pub nonce: String,
-    pub challenge_secret: String,
+    pub nonce: Option<String>,
+    pub challenge_secret: Option<String>,
+    pub answer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -162,16 +163,7 @@ pub async fn handle_request(
         .and_then(|c| c.to_str().ok())
         .unwrap_or("");
 
-    let cookie_valid = verify_challenge_cookie(cookie_str, ip, now_secs);
-
-    if !cookie_valid && is_subresource_request(&req) {
-        crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
-        return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")
-            .body(empty_body())
-            .unwrap());
-    }
+    let clearance = challenge_clearance(cookie_str, ip, now_secs);
 
     let (current_stage, backend_base, request_allowed) = {
         let domain_config = crate::state::DOMAIN_CONFIG.with(|configs| {
@@ -193,14 +185,14 @@ pub async fn handle_request(
             
             if now_secs.saturating_sub(d.last_reset_secs) >= 1 {
                 if d.bypassed_requests >= STAGE_THRESHOLD {
-                    let new = d.stage.saturating_add(1).min(3);
+                    let new = d.stage.saturating_add(1).min(4);
                     d.stage = new;
                 }
                 d.bypassed_requests = 0;
                 d.last_reset_secs = now_secs;
             }
             
-            let allowed = d.stage == 0 || cookie_valid;
+            let allowed = d.stage == 0 || clearance >= d.stage;
             
             if allowed {
                 d.bypassed_requests += 1;
@@ -210,11 +202,20 @@ pub async fn handle_request(
         })
     };
 
-    if !cookie_valid {
-        match current_stage {
-            0 => {}
-            1 => {
-                let cookie_value = create_challenge_cookie_value(ip, now_secs);
+    if !request_allowed && is_subresource_request(&req) {
+        crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")
+            .body(empty_body())
+            .unwrap());
+    }
+
+    if !request_allowed {
+        match next_challenge_stage(clearance, current_stage) {
+            None => {}
+            Some(1) => {
+                let cookie_value = create_challenge_cookie_value(ip, now_secs, 1);
                 let forwarded_proto = req.headers()
                     .get("X-Forwarded-Proto")
                     .and_then(|v| v.to_str().ok())
@@ -232,7 +233,7 @@ pub async fn handle_request(
                     .body(static_body(STAGE1_HTML))
                     .unwrap());
             }
-            2 => {
+            Some(2) => {
                 let token = create_js_challenge_token(ip, now_secs);
                 let mut js_challenge = String::with_capacity(300);
                 js_challenge.push_str("<!doctype html><html style=background:#121212><script type=module>import{run}from'https://cdn.jsdelivr.net/gh/libalpm64/Blake3-JS@edd695e564ebdbced1e9036193ca4afc3f0c7a01/arin-browser.js';run('");
@@ -246,7 +247,7 @@ pub async fn handle_request(
                     .body(full_body(Bytes::from(js_challenge)))
                     .unwrap());
             }
-            3 => {
+            Some(3) => {
                 let challenge_secret = create_pow_ticket(ip, domain, now_secs);
                 let pow_html = match generate_pow_html(&challenge_secret, POW_DIFFICULTY) {
                     Ok(html) => html,
@@ -263,7 +264,23 @@ pub async fn handle_request(
                     .body(full_body(Bytes::from(pow_html)))
                     .unwrap());
             }
-            _ => return Ok(Response::builder()
+            Some(4) => {
+                let challenge = crate::vdf::issue(ip, domain.to_owned());
+                let vdf_html = match crate::vdf::generate_vdf_html(&challenge) {
+                    Ok(html) => html,
+                    Err(_) => return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(static_body(CHALLENGE_ERROR_BODY))
+                        .unwrap()),
+                };
+                crate::state::LOCAL_CHALLENGED.with(|c| c.set(c.get() + 1));
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .body(full_body(Bytes::from(vdf_html)))
+                    .unwrap());
+            }
+            Some(_) => return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(static_body(BLOCKED_BODY))
                 .unwrap()),
@@ -310,7 +327,11 @@ pub async fn validate_js(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let verified = verify_js_challenge_token(&js_request.token, ip, now_secs)
+    let cookie_str = parts.headers.get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let verified = challenge_clearance(cookie_str, ip, now_secs) >= 1
+        && verify_js_challenge_token(&js_request.token, ip, now_secs)
         && verify_js_proof(&js_request.token, js_request.nonce);
     let resp_body = PowValidationResponse { verified };
     let mut response = Response::builder()
@@ -318,7 +339,7 @@ pub async fn validate_js(
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store");
     if verified {
-        let cookie_value = create_challenge_cookie_value(ip, now_secs);
+        let cookie_value = create_challenge_cookie_value(ip, now_secs, 2);
         let forwarded_proto = parts.headers.get("X-Forwarded-Proto")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("http");
@@ -367,24 +388,32 @@ pub async fn validate_pow(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if !verify_pow_ticket(&pow_request.challenge_secret, ip, &domain, now_secs) {
-        let resp_body = PowValidationResponse { verified: false };
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(full_body(Bytes::from(serde_json::to_string(&resp_body).unwrap_or_default())))
-            .unwrap());
-    }
-    let difficulty_bits = POW_DIFFICULTY as usize;
-    
-    let verified_rx = crate::state::POW_POOL.with(|pool| {
-        pool.borrow().submit(pow_request.nonce, pow_request.challenge_secret, difficulty_bits)
-    });
-    
-    let verified = verified_rx.await.unwrap_or(false);
+    let cookie_str = parts.headers.get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let clearance = challenge_clearance(cookie_str, ip, now_secs);
+    let PowValidationRequest { nonce, challenge_secret, answer } = pow_request;
+    let (verified, granted_level) = if let Some(answer) = answer {
+        if clearance < 3 {
+            (false, 4)
+        } else {
+            (crate::vdf::submit(answer, ip, domain.clone()).await.unwrap_or(false), 4)
+        }
+    } else if let (Some(nonce), Some(challenge_secret)) = (nonce, challenge_secret) {
+        if clearance < 2 || !verify_pow_ticket(&challenge_secret, ip, &domain, now_secs) {
+            (false, 3)
+        } else {
+            let verified_rx = crate::state::POW_POOL.with(|pool| {
+                pool.borrow().submit(nonce, challenge_secret, POW_DIFFICULTY as usize)
+            });
+            (verified_rx.await.unwrap_or(false), 3)
+        }
+    } else {
+        (false, 0)
+    };
 
     if verified {
-        let cookie_value = create_challenge_cookie_value(ip, now_secs);
+        let cookie_value = create_challenge_cookie_value(ip, now_secs, granted_level);
         let forwarded_proto = parts.headers.get("X-Forwarded-Proto")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("http");
@@ -462,37 +491,45 @@ fn content_length_exceeds<B>(req: &Request<B>, limit: usize) -> bool {
 }
 
 #[inline]
-fn verify_challenge_cookie(cookie_str: &str, ip: IpAddr, now_secs: u64) -> bool {
+fn challenge_clearance(cookie_str: &str, ip: IpAddr, now_secs: u64) -> u8 {
     let arin_value = cookie_str.split(';')
         .map(|s| s.trim())
         .find_map(|s| s.strip_prefix("Arin="));
-    
-    let Some(value) = arin_value else { return false };
-    
-    let (ts_str, hash_hex) = match value.split_once(':') {
-        Some(parts) => parts,
-        None => return false,
-    };
-    
-    let Ok(ts) = ts_str.parse::<u64>() else { return false };
-    
-    if now_secs.saturating_sub(ts) > CHALLENGE_TTL_SECS {
-        return false;
+    let Some(value) = arin_value else { return 0 };
+    let mut parts = value.split(':');
+    let Some(level) = parts.next().and_then(|value| value.parse::<u8>().ok()) else { return 0 };
+    let Some(timestamp) = parts.next().and_then(|value| value.parse::<u64>().ok()) else { return 0 };
+    let Some(hash) = parts.next() else { return 0 };
+    if parts.next().is_some()
+        || !(1..=4).contains(&level)
+        || timestamp > now_secs
+        || now_secs.saturating_sub(timestamp) > CHALLENGE_TTL_SECS
+    {
+        return 0;
     }
-    
-    let expected = hash_ip_with_timestamp(ip, ts);
-    hash_hex.eq_ignore_ascii_case(&expected)
+    if hash.eq_ignore_ascii_case(&hash_clearance(ip, timestamp, level)) { level } else { 0 }
 }
 
 #[inline]
-fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64) -> String {
-    let hash = hash_ip_with_timestamp(ip, timestamp);
+fn create_challenge_cookie_value(ip: IpAddr, timestamp: u64, level: u8) -> String {
+    let hash = hash_clearance(ip, timestamp, level);
     let ts_str = timestamp.to_string();
-    let mut out = String::with_capacity(ts_str.len() + 1 + hash.len());
+    let mut out = String::with_capacity(ts_str.len() + 3 + hash.len());
+    out.push(HEX_CHARS[level as usize] as char);
+    out.push(':');
     out.push_str(&ts_str);
     out.push(':');
     out.push_str(&hash);
     out
+}
+
+#[inline]
+fn next_challenge_stage(clearance: u8, configured_stage: u8) -> Option<u8> {
+    if configured_stage == 0 || clearance >= configured_stage {
+        None
+    } else {
+        Some(clearance.saturating_add(1).min(configured_stage).min(4))
+    }
 }
 
 #[inline]
@@ -588,13 +625,15 @@ fn hash_pow_ticket(ip: IpAddr, domain: &str, fields: &str) -> String {
 }
 
 #[inline]
-fn hash_ip_with_timestamp(ip: IpAddr, timestamp: u64) -> String {
+fn hash_clearance(ip: IpAddr, timestamp: u64, level: u8) -> String {
     let key = crate::state::COOKIE_KEY.with(|k| *k.borrow());
     let mut hasher = blake3::Hasher::new_keyed(&key);
+    hasher.update(b"arin-clearance-v1");
     match ip {
         IpAddr::V4(addr) => { hasher.update(&addr.octets()); }
         IpAddr::V6(addr) => { hasher.update(&addr.octets()); }
     }
+    hasher.update(&[level]);
     hasher.update(&timestamp.to_be_bytes());
     let bytes = hasher.finalize();
     hex_encode(bytes.as_bytes())
@@ -687,6 +726,23 @@ mod tests {
         assert!(!verify_pow_ticket(&ticket, "192.0.2.2".parse().unwrap(), "example.com", 100));
         assert!(!verify_pow_ticket(&ticket, ip, "other.example", 100));
         assert!(!verify_pow_ticket(&ticket, ip, "example.com", 161));
+    }
+
+    #[test]
+    fn clearance_advances_one_stage_at_a_time() {
+        let ip = "192.0.2.1".parse().unwrap();
+        for level in 1..=4 {
+            let value = create_challenge_cookie_value(ip, 100, level);
+            assert_eq!(challenge_clearance(&format!("Arin={}", value), ip, 100), level);
+        }
+        let value = create_challenge_cookie_value(ip, 100, 3);
+        assert_eq!(challenge_clearance(&format!("Arin={}", value), "192.0.2.2".parse().unwrap(), 100), 0);
+        assert_eq!(challenge_clearance(&format!("Arin={}", value), ip, 401), 0);
+        assert_eq!(next_challenge_stage(0, 4), Some(1));
+        assert_eq!(next_challenge_stage(1, 4), Some(2));
+        assert_eq!(next_challenge_stage(2, 4), Some(3));
+        assert_eq!(next_challenge_stage(3, 4), Some(4));
+        assert_eq!(next_challenge_stage(4, 4), None);
     }
 
     #[test]

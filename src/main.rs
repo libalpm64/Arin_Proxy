@@ -1,6 +1,7 @@
 mod config;
 mod state;
 mod pow;
+mod vdf;
 mod handlers;
 
 use std::collections::HashMap;
@@ -211,6 +212,7 @@ fn main() -> std::io::Result<()> {
     
     let config = Arc::new(config);
     let cookie_key: [u8; 32] = *blake3::hash(config.cookie_secret.as_bytes()).as_bytes();
+    crate::vdf::init();
     
     let (stats_tx, stats_rx) = bounded(64);
     
