@@ -246,7 +246,7 @@ pub async fn handle_request(
             Some(2) => {
                 let token = create_js_challenge_token(ip, now_secs);
                 let mut js_challenge = String::with_capacity(300);
-                js_challenge.push_str("<!doctype html><html style=background:#121212><script type=module>import{run}from'https://cdn.jsdelivr.net/gh/libalpm64/Blake3-JS@b4478839f4f88e7bcbb16ecdee0eee02ee05663f/arin-browser.js';run('");
+                js_challenge.push_str("<!doctype html><html style=background:#121212><script type=module>import{run}from'https://cdn.jsdelivr.net/gh/libalpm64/Blake3-JS@c27cadca6e2f554e1e6d9ad688a725bcd7d48b30/arin-browser.js';run('");
                 js_challenge.push_str(&token);
                 js_challenge.push_str("')</script>");
                 
