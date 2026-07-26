@@ -3,7 +3,7 @@ use rsa::{BigUint, RsaPrivateKey, traits::{PrivateKeyParts, PublicKeyParts}};
 use std::{collections::VecDeque, net::IpAddr, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
 use tokio::sync::oneshot;
 
-pub const VDF_DIFFICULTY: u64 = 300_000;
+pub const VDF_DIFFICULTY: u64 = 1 << 22;
 const WIDTH: usize = 256;
 const MAX_PENDING: usize = 32_768;
 
