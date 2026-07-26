@@ -5,9 +5,8 @@ use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{Receiver, sync_channel},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -21,9 +20,8 @@ const NONCE_WIDTH: usize = 24;
 const TAG_WIDTH: usize = 16;
 const META_WIDTH: usize = 1 + NODE_WIDTH + ID_WIDTH + SEED_WIDTH + 8 + 8 + 32 + 32;
 const TICKET_WIDTH: usize = META_WIDTH + NONCE_WIDTH + WIDTH + TAG_WIDTH;
-const POOL_CAPACITY: usize = 10_000;
-const POOL_PREWARM: usize = 1_024;
-const MAX_ACTIVE: usize = 65_536;
+const POOL_CAPACITY: usize = 1_000_000;
+const POOL_PREWARM: usize = 10_000;
 const MAX_GRANTS: usize = 65_536;
 const TICKET_TTL_SECS: u64 = 30;
 const GRANT_TTL_SECS: u64 = 10;
@@ -50,21 +48,18 @@ struct Capsule {
     id: [u8; ID_WIDTH],
     seed: [u8; SEED_WIDTH],
     endpoint: [u8; WIDTH],
+    solved: AtomicBool,
 }
 
 struct CapsulePool {
-    receiver: Mutex<Receiver<Capsule>>,
+    entries: Mutex<VecDeque<Arc<Capsule>>>,
+    changed: Condvar,
 }
 
 struct Grant {
     ip: IpAddr,
     request_digest: [u8; 32],
     expires: u64,
-}
-
-struct ActiveSet {
-    entries: HashMap<[u8; ID_WIDTH], u64>,
-    expiries: VecDeque<(u64, [u8; ID_WIDTH])>,
 }
 
 struct GrantStore {
@@ -74,18 +69,16 @@ struct GrantStore {
 
 static PARAMS: OnceLock<Params> = OnceLock::new();
 static POOL: OnceLock<CapsulePool> = OnceLock::new();
-static ACTIVE: OnceLock<Mutex<ActiveSet>> = OnceLock::new();
+static REGISTRY: OnceLock<Mutex<HashMap<[u8; ID_WIDTH], Arc<Capsule>>>> = OnceLock::new();
 static GRANTS: OnceLock<Mutex<GrantStore>> = OnceLock::new();
+static PRODUCERS: OnceLock<()> = OnceLock::new();
 
 fn params() -> &'static Params {
     PARAMS.get().expect("VDF is not initialized")
 }
 
-fn active() -> &'static Mutex<ActiveSet> {
-    ACTIVE.get_or_init(|| Mutex::new(ActiveSet {
-        entries: HashMap::with_capacity(MAX_ACTIVE),
-        expiries: VecDeque::with_capacity(MAX_ACTIVE),
-    }))
+fn registry() -> &'static Mutex<HashMap<[u8; ID_WIDTH], Arc<Capsule>>> {
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::with_capacity(POOL_CAPACITY)))
 }
 
 fn grants() -> &'static Mutex<GrantStore> {
@@ -93,25 +86,6 @@ fn grants() -> &'static Mutex<GrantStore> {
         entries: HashMap::with_capacity(MAX_GRANTS),
         expiries: VecDeque::with_capacity(MAX_GRANTS),
     }))
-}
-
-impl ActiveSet {
-    fn cleanup(&mut self, now_secs: u64) {
-        while self.expiries.front().is_some_and(|(expiry, _)| *expiry < now_secs) {
-            let (expiry, id) = self.expiries.pop_front().unwrap();
-            if self.entries.get(&id).is_some_and(|stored| *stored == expiry) {
-                self.entries.remove(&id);
-            }
-        }
-    }
-
-    fn insert(&mut self, id: [u8; ID_WIDTH], expiry: u64) -> bool {
-        if self.entries.insert(id, expiry).is_some() {
-            return false;
-        }
-        self.expiries.push_back((expiry, id));
-        true
-    }
 }
 
 impl GrantStore {
@@ -135,32 +109,70 @@ impl GrantStore {
 }
 
 pub fn init() {
-    let initialized = PARAMS.get_or_init(|| Params::generate(2048, VDF_DIFFICULTY));
-    let _ = active();
+    let _ = PARAMS.get_or_init(|| Params::generate(2048, VDF_DIFFICULTY));
+    let _ = registry();
     let _ = grants();
-    POOL.get_or_init(|| {
-        let (sender, receiver) = sync_channel(POOL_CAPACITY);
-        let generated = Arc::new(AtomicUsize::new(0));
+    let pool = POOL.get_or_init(|| CapsulePool {
+        entries: Mutex::new(VecDeque::with_capacity(POOL_CAPACITY)),
+        changed: Condvar::new(),
+    });
+    PRODUCERS.get_or_init(|| {
         let workers = num_cpus::get().clamp(1, 8);
         for _ in 0..workers {
-            let sender = sender.clone();
-            let generated = generated.clone();
-            std::thread::spawn(move || {
-                loop {
-                    if sender.send(params().capsule()).is_err() {
-                        break;
-                    }
-                    generated.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            std::thread::spawn(produce_capsules);
         }
-        drop(sender);
-        while generated.load(Ordering::Relaxed) < POOL_PREWARM {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let _ = initialized;
-        CapsulePool { receiver: Mutex::new(receiver) }
+        std::thread::spawn(refresh_capsules);
     });
+    let mut entries = pool.entries.lock().unwrap_or_else(|error| error.into_inner());
+    while entries.len() < POOL_PREWARM {
+        entries = pool.changed.wait(entries).unwrap_or_else(|error| error.into_inner());
+    }
+}
+
+fn produce_capsules() {
+    loop {
+        let pool = POOL.get().unwrap();
+        let entries = pool.entries.lock().unwrap_or_else(|error| error.into_inner());
+        let entries = pool.changed.wait_while(entries, |entries| {
+            entries.len() >= POOL_CAPACITY
+        }).unwrap_or_else(|error| error.into_inner());
+        drop(entries);
+        let capsule = params().capsule();
+        let mut entries = pool.entries.lock().unwrap_or_else(|error| error.into_inner());
+        if entries.len() >= POOL_CAPACITY {
+            continue;
+        }
+        let mut registry = registry().lock().unwrap_or_else(|error| error.into_inner());
+        if registry.contains_key(&capsule.id) {
+            continue;
+        }
+        registry.insert(capsule.id, capsule.clone());
+        entries.push_back(capsule);
+        pool.changed.notify_all();
+    }
+}
+
+fn refresh_capsules() {
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let pool = POOL.get().unwrap();
+        let mut entries = pool.entries.lock().unwrap_or_else(|error| error.into_inner());
+        let mut removed = Vec::new();
+        entries.retain(|capsule| {
+            let keep = !capsule.solved.load(Ordering::Acquire);
+            if !keep {
+                removed.push(capsule.id);
+            }
+            keep
+        });
+        if !removed.is_empty() {
+            let mut registry = registry().lock().unwrap_or_else(|error| error.into_inner());
+            for id in removed {
+                registry.remove(&id);
+            }
+            pool.changed.notify_all();
+        }
+    }
 }
 
 impl Params {
@@ -192,7 +204,7 @@ impl Params {
         }
     }
 
-    fn capsule(&self) -> Capsule {
+    fn capsule(&self) -> Arc<Capsule> {
         loop {
             let mut id = [0u8; ID_WIDTH];
             let mut seed = [0u8; SEED_WIDTH];
@@ -209,7 +221,12 @@ impl Params {
                 let delta = (&endpoint_p + &self.p - endpoint_q_p) % &self.p;
                 let coefficient = (delta * &self.q_inverse) % &self.p;
                 let endpoint = fixed(&(endpoint_q + &self.q * coefficient).to_bytes_be());
-                return Capsule { id, seed, endpoint };
+                return Arc::new(Capsule {
+                    id,
+                    seed,
+                    endpoint,
+                    solved: AtomicBool::new(false),
+                });
             }
         }
     }
@@ -288,10 +305,17 @@ impl Params {
     }
 }
 
-fn next_capsule() -> Capsule {
-    POOL.get()
-        .and_then(|pool| pool.receiver.lock().unwrap_or_else(|error| error.into_inner()).try_recv().ok())
-        .unwrap_or_else(|| params().capsule())
+fn next_capsule() -> Option<Arc<Capsule>> {
+    let pool = POOL.get()?;
+    let mut entries = pool.entries.lock().unwrap_or_else(|error| error.into_inner());
+    for _ in 0..entries.len() {
+        let capsule = entries.pop_front()?;
+        entries.push_back(capsule.clone());
+        if !capsule.solved.load(Ordering::Acquire) {
+            return Some(capsule);
+        }
+    }
+    None
 }
 
 fn gcd(mut left: BigUint, mut right: BigUint) -> BigUint {
@@ -415,15 +439,7 @@ pub fn issue(
     session_binding: [u8; 32],
     now_secs: u64,
 ) -> Option<BrowserChallenge> {
-    let capsule = next_capsule();
-    let mut active = active().lock().unwrap_or_else(|error| error.into_inner());
-    active.cleanup(now_secs);
-    if active.entries.len() >= MAX_ACTIVE
-        || !active.insert(capsule.id, now_secs + TICKET_TTL_SECS)
-    {
-        return None;
-    }
-    drop(active);
+    let capsule = next_capsule()?;
     let ticket = params().ticket(&capsule, request_digest, session_binding, now_secs);
     Some(BrowserChallenge {
         modulus: encode_hex(&fixed(&params().modulus.to_bytes_be())),
@@ -442,10 +458,17 @@ pub fn submit(
     now_secs: u64,
 ) -> Option<String> {
     let (id, request_digest, expiry) = params().open(ticket, answer, session_binding, now_secs)?;
-    let mut active = active().lock().unwrap_or_else(|error| error.into_inner());
-    active.cleanup(now_secs);
-    active.entries.remove(&id)?;
-    drop(active);
+    let capsule = registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&id)
+        .cloned()?;
+    capsule.solved.compare_exchange(
+        false,
+        true,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ).ok()?;
     if !backend_available {
         return None;
     }
@@ -540,16 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_queues_remove_only_expired_entries() {
-        let mut active = ActiveSet {
-            entries: HashMap::new(),
-            expiries: VecDeque::new(),
-        };
-        assert!(active.insert([1u8; ID_WIDTH], 100));
-        assert!(active.insert([2u8; ID_WIDTH], 110));
-        active.cleanup(101);
-        assert!(!active.entries.contains_key(&[1u8; ID_WIDTH]));
-        assert!(active.entries.contains_key(&[2u8; ID_WIDTH]));
+    fn expiry_queue_removes_only_expired_entries() {
         let mut grants = GrantStore {
             entries: HashMap::new(),
             expiries: VecDeque::new(),
@@ -561,6 +575,27 @@ mod tests {
         }));
         grants.cleanup(101);
         assert!(!grants.entries.contains_key(&[3u8; ID_WIDTH]));
+    }
+
+    #[test]
+    fn capsule_leases_do_not_consume_unsolved_work() {
+        let params = Params::generate(1024, 32);
+        let capsule = params.capsule();
+        let _ = params.ticket(&capsule, [5u8; 32], [6u8; 32], 100);
+        let _ = params.ticket(&capsule, [7u8; 32], [8u8; 32], 100);
+        assert!(!capsule.solved.load(Ordering::Acquire));
+        assert!(capsule.solved.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_ok());
+        assert!(capsule.solved.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_err());
     }
 
     #[test]
@@ -644,17 +679,19 @@ mod tests {
         let ip = "192.0.2.1".parse().unwrap();
         let prepare = |start_index: u64, count: u64| {
             let mut tickets = Vec::with_capacity(count as usize);
-            let mut active = active().lock().unwrap();
+            let mut registry = registry().lock().unwrap();
             for index in start_index..start_index + count {
-                let mut item = Capsule {
-                    id: [0u8; ID_WIDTH],
+                let mut id = [0u8; ID_WIDTH];
+                id[8..].copy_from_slice(&index.to_be_bytes());
+                let item = Arc::new(Capsule {
+                    id,
                     seed: capsule.seed,
                     endpoint: capsule.endpoint,
-                };
-                item.id[8..].copy_from_slice(&index.to_be_bytes());
+                    solved: AtomicBool::new(false),
+                });
                 let request = *blake3::hash(&index.to_be_bytes()).as_bytes();
                 tickets.push(params.ticket(&item, request, session, 100));
-                assert!(active.insert(item.id, 130));
+                assert!(registry.insert(item.id, item).is_none());
             }
             tickets
         };
@@ -689,6 +726,50 @@ mod tests {
         let elapsed = start.elapsed();
         eprintln!(
             "submissions={} workers=8 elapsed_ms={} submissions_per_second={}",
+            count,
+            elapsed.as_millis(),
+            count as u128 * 1000 / elapsed.as_millis().max(1),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_leased_issuance() {
+        let params = PARAMS.get_or_init(|| Params::generate(2048, VDF_DIFFICULTY));
+        let capsule = params.capsule();
+        let entries = (0..10_000).map(|_| capsule.clone()).collect();
+        let _ = POOL.set(CapsulePool {
+            entries: Mutex::new(entries),
+            changed: Condvar::new(),
+        });
+        let request = [53u8; 32];
+        let session = [59u8; 32];
+        let count = 100_000u64;
+        let start = std::time::Instant::now();
+        for _ in 0..count {
+            assert!(issue(request, session, 100).is_some());
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "issuances={} workers=1 elapsed_ms={} issuances_per_second={}",
+            count,
+            elapsed.as_millis(),
+            count as u128 * 1000 / elapsed.as_millis().max(1),
+        );
+        let count = 400_000u64;
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..count / 8 {
+                        assert!(issue(request, session, 100).is_some());
+                    }
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+        eprintln!(
+            "issuances={} workers=8 elapsed_ms={} issuances_per_second={}",
             count,
             elapsed.as_millis(),
             count as u128 * 1000 / elapsed.as_millis().max(1),
