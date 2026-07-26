@@ -2,7 +2,7 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::AeadInPlace};
 use rand::{RngCore, rngs::OsRng};
 use rsa::{BigUint, RsaPrivateKey, traits::{PrivateKeyParts, PublicKeyParts}};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
         Arc, Mutex, OnceLock,
@@ -62,21 +62,76 @@ struct Grant {
     expires: u64,
 }
 
+struct ActiveSet {
+    entries: HashMap<[u8; ID_WIDTH], u64>,
+    expiries: VecDeque<(u64, [u8; ID_WIDTH])>,
+}
+
+struct GrantStore {
+    entries: HashMap<[u8; ID_WIDTH], Grant>,
+    expiries: VecDeque<(u64, [u8; ID_WIDTH])>,
+}
+
 static PARAMS: OnceLock<Params> = OnceLock::new();
 static POOL: OnceLock<CapsulePool> = OnceLock::new();
-static ACTIVE: OnceLock<Mutex<HashMap<[u8; ID_WIDTH], u64>>> = OnceLock::new();
-static GRANTS: OnceLock<Mutex<HashMap<[u8; ID_WIDTH], Grant>>> = OnceLock::new();
+static ACTIVE: OnceLock<Mutex<ActiveSet>> = OnceLock::new();
+static GRANTS: OnceLock<Mutex<GrantStore>> = OnceLock::new();
 
 fn params() -> &'static Params {
     PARAMS.get().expect("VDF is not initialized")
 }
 
-fn active() -> &'static Mutex<HashMap<[u8; ID_WIDTH], u64>> {
-    ACTIVE.get_or_init(|| Mutex::new(HashMap::with_capacity(MAX_ACTIVE)))
+fn active() -> &'static Mutex<ActiveSet> {
+    ACTIVE.get_or_init(|| Mutex::new(ActiveSet {
+        entries: HashMap::with_capacity(MAX_ACTIVE),
+        expiries: VecDeque::with_capacity(MAX_ACTIVE),
+    }))
 }
 
-fn grants() -> &'static Mutex<HashMap<[u8; ID_WIDTH], Grant>> {
-    GRANTS.get_or_init(|| Mutex::new(HashMap::with_capacity(MAX_GRANTS)))
+fn grants() -> &'static Mutex<GrantStore> {
+    GRANTS.get_or_init(|| Mutex::new(GrantStore {
+        entries: HashMap::with_capacity(MAX_GRANTS),
+        expiries: VecDeque::with_capacity(MAX_GRANTS),
+    }))
+}
+
+impl ActiveSet {
+    fn cleanup(&mut self, now_secs: u64) {
+        while self.expiries.front().is_some_and(|(expiry, _)| *expiry < now_secs) {
+            let (expiry, id) = self.expiries.pop_front().unwrap();
+            if self.entries.get(&id).is_some_and(|stored| *stored == expiry) {
+                self.entries.remove(&id);
+            }
+        }
+    }
+
+    fn insert(&mut self, id: [u8; ID_WIDTH], expiry: u64) -> bool {
+        if self.entries.insert(id, expiry).is_some() {
+            return false;
+        }
+        self.expiries.push_back((expiry, id));
+        true
+    }
+}
+
+impl GrantStore {
+    fn cleanup(&mut self, now_secs: u64) {
+        while self.expiries.front().is_some_and(|(expiry, _)| *expiry < now_secs) {
+            let (expiry, id) = self.expiries.pop_front().unwrap();
+            if self.entries.get(&id).is_some_and(|grant| grant.expires == expiry) {
+                self.entries.remove(&id);
+            }
+        }
+    }
+
+    fn insert(&mut self, token: [u8; ID_WIDTH], grant: Grant) -> bool {
+        let expiry = grant.expires;
+        if self.entries.insert(token, grant).is_some() {
+            return false;
+        }
+        self.expiries.push_back((expiry, token));
+        true
+    }
 }
 
 pub fn init() {
@@ -362,8 +417,10 @@ pub fn issue(
 ) -> Option<BrowserChallenge> {
     let capsule = next_capsule();
     let mut active = active().lock().unwrap_or_else(|error| error.into_inner());
-    active.retain(|_, expiry| *expiry >= now_secs);
-    if active.len() >= MAX_ACTIVE || active.insert(capsule.id, now_secs + TICKET_TTL_SECS).is_some() {
+    active.cleanup(now_secs);
+    if active.entries.len() >= MAX_ACTIVE
+        || !active.insert(capsule.id, now_secs + TICKET_TTL_SECS)
+    {
         return None;
     }
     drop(active);
@@ -386,8 +443,8 @@ pub fn submit(
 ) -> Option<String> {
     let (id, request_digest, expiry) = params().open(ticket, answer, session_binding, now_secs)?;
     let mut active = active().lock().unwrap_or_else(|error| error.into_inner());
-    active.retain(|_, item_expiry| *item_expiry >= now_secs);
-    active.remove(&id)?;
+    active.cleanup(now_secs);
+    active.entries.remove(&id)?;
     drop(active);
     if !backend_available {
         return None;
@@ -395,15 +452,17 @@ pub fn submit(
     let mut token = [0u8; ID_WIDTH];
     OsRng.fill_bytes(&mut token);
     let mut grants = grants().lock().unwrap_or_else(|error| error.into_inner());
-    grants.retain(|_, grant| grant.expires >= now_secs);
-    if grants.len() >= MAX_GRANTS {
+    grants.cleanup(now_secs);
+    if grants.entries.len() >= MAX_GRANTS {
         return None;
     }
-    grants.insert(token, Grant {
+    if !grants.insert(token, Grant {
         ip,
         request_digest,
         expires: expiry.min(now_secs + GRANT_TTL_SECS),
-    });
+    }) {
+        return None;
+    }
     Some(encode64(&token))
 }
 
@@ -416,8 +475,8 @@ pub fn consume_grant(
     let Some(bytes) = decode64(token) else { return false };
     let Ok(token) = <[u8; ID_WIDTH]>::try_from(bytes.as_slice()) else { return false };
     let mut grants = grants().lock().unwrap_or_else(|error| error.into_inner());
-    grants.retain(|_, grant| grant.expires >= now_secs);
-    grants.remove(&token).is_some_and(|grant| {
+    grants.cleanup(now_secs);
+    grants.entries.remove(&token).is_some_and(|grant| {
         grant.ip == ip
             && grant.expires >= now_secs
             && constant_eq(&grant.request_digest, &request_digest)
@@ -481,6 +540,30 @@ mod tests {
     }
 
     #[test]
+    fn expiry_queues_remove_only_expired_entries() {
+        let mut active = ActiveSet {
+            entries: HashMap::new(),
+            expiries: VecDeque::new(),
+        };
+        assert!(active.insert([1u8; ID_WIDTH], 100));
+        assert!(active.insert([2u8; ID_WIDTH], 110));
+        active.cleanup(101);
+        assert!(!active.entries.contains_key(&[1u8; ID_WIDTH]));
+        assert!(active.entries.contains_key(&[2u8; ID_WIDTH]));
+        let mut grants = GrantStore {
+            entries: HashMap::new(),
+            expiries: VecDeque::new(),
+        };
+        assert!(grants.insert([3u8; ID_WIDTH], Grant {
+            ip: "192.0.2.1".parse().unwrap(),
+            request_digest: [4u8; 32],
+            expires: 100,
+        }));
+        grants.cleanup(101);
+        assert!(!grants.entries.contains_key(&[3u8; ID_WIDTH]));
+    }
+
+    #[test]
     #[ignore]
     fn benchmark_private_verifier() {
         let params = Params::generate(2048, VDF_DIFFICULTY);
@@ -524,6 +607,91 @@ mod tests {
             VDF_DIFFICULTY,
             elapsed.as_millis(),
             VDF_DIFFICULTY as u128 * 1000 / elapsed.as_millis().max(1),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_parallel_capsule_generation() {
+        let params = std::sync::Arc::new(Params::generate(2048, VDF_DIFFICULTY));
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..8).map(|_| {
+            let params = params.clone();
+            std::thread::spawn(move || {
+                for _ in 0..128 {
+                    let _ = params.capsule();
+                }
+            })
+        }).collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "capsules=1024 workers=8 elapsed_ms={} capsules_per_second={}",
+            elapsed.as_millis(),
+            1_024_000u128 / elapsed.as_millis().max(1),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_full_submit_path() {
+        let params = PARAMS.get_or_init(|| Params::generate(2048, VDF_DIFFICULTY));
+        let capsule = params.capsule();
+        let answer = encode64(&capsule.endpoint);
+        let session = [47u8; 32];
+        let ip = "192.0.2.1".parse().unwrap();
+        let prepare = |start_index: u64, count: u64| {
+            let mut tickets = Vec::with_capacity(count as usize);
+            let mut active = active().lock().unwrap();
+            for index in start_index..start_index + count {
+                let mut item = Capsule {
+                    id: [0u8; ID_WIDTH],
+                    seed: capsule.seed,
+                    endpoint: capsule.endpoint,
+                };
+                item.id[8..].copy_from_slice(&index.to_be_bytes());
+                let request = *blake3::hash(&index.to_be_bytes()).as_bytes();
+                tickets.push(params.ticket(&item, request, session, 100));
+                assert!(active.insert(item.id, 130));
+            }
+            tickets
+        };
+        let count = 20_000u64;
+        let tickets = prepare(1, count);
+        let start = std::time::Instant::now();
+        for ticket in &tickets {
+            assert!(submit(ticket, &answer, ip, session, true, 100).is_some());
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "submissions={} workers=1 elapsed_ms={} submissions_per_second={}",
+            count,
+            elapsed.as_millis(),
+            count as u128 * 1000 / elapsed.as_millis().max(1),
+        );
+        grants().lock().unwrap().entries.clear();
+        grants().lock().unwrap().expiries.clear();
+        let count = 40_000u64;
+        let tickets = prepare(100_000, count);
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for chunk in tickets.chunks(count as usize / 8) {
+                let answer = &answer;
+                scope.spawn(move || {
+                    for ticket in chunk {
+                        assert!(submit(ticket, answer, ip, session, true, 100).is_some());
+                    }
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+        eprintln!(
+            "submissions={} workers=8 elapsed_ms={} submissions_per_second={}",
+            count,
+            elapsed.as_millis(),
+            count as u128 * 1000 / elapsed.as_millis().max(1),
         );
     }
 }
