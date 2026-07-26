@@ -17,6 +17,7 @@ crossbeam-channel = "0.5"
 num_cpus = "1.16"
 rsa = { version = "0.9", default-features = false, features = ["std"] }
 rand = "0.8"
+chacha20poly1305 = "0.10"
 
 [profile.release]
 opt-level = 3

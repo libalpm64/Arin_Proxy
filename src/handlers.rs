@@ -39,6 +39,7 @@ pub struct PowValidationRequest {
     pub nonce: Option<String>,
     pub challenge_secret: Option<String>,
     pub answer: Option<String>,
+    pub ticket: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,7 +164,16 @@ pub async fn handle_request(
         .and_then(|c| c.to_str().ok())
         .unwrap_or("");
 
-    let clearance = challenge_clearance(cookie_str, ip, now_secs);
+    let mut clearance = challenge_clearance(cookie_str, ip, now_secs);
+    if clearance >= 3 {
+        if let Some(token) = cookie_value(cookie_str, "ArinVdf") {
+            let path = req.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/");
+            let digest = crate::vdf::request_digest(req.method().as_str(), domain, path);
+            if crate::vdf::consume_grant(token, ip, digest, now_secs) {
+                clearance = 4;
+            }
+        }
+    }
 
     let (current_stage, backend_base, request_allowed) = {
         let domain_config = crate::state::DOMAIN_CONFIG.with(|configs| {
@@ -265,7 +275,21 @@ pub async fn handle_request(
                     .unwrap());
             }
             Some(4) => {
-                let challenge = crate::vdf::issue(ip, domain.to_owned());
+                if req.method() != hyper::Method::GET {
+                    return Ok(Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(static_body(BLOCKED_BODY))
+                        .unwrap());
+                }
+                let path = req.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/");
+                let request_digest = crate::vdf::request_digest(req.method().as_str(), domain, path);
+                let session = crate::vdf::session_binding(ip, cookie_value(cookie_str, "Arin").unwrap_or(""));
+                let Some(challenge) = crate::vdf::issue(request_digest, session, now_secs) else {
+                    return Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(static_body(CHALLENGE_ERROR_BODY))
+                        .unwrap());
+                };
                 let vdf_html = match crate::vdf::generate_vdf_html(&challenge) {
                     Ok(html) => html,
                     Err(_) => return Ok(Response::builder()
@@ -392,28 +416,30 @@ pub async fn validate_pow(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let clearance = challenge_clearance(cookie_str, ip, now_secs);
-    let PowValidationRequest { nonce, challenge_secret, answer } = pow_request;
-    let (verified, granted_level) = if let Some(answer) = answer {
+    let PowValidationRequest { nonce, challenge_secret, answer, ticket } = pow_request;
+    let (verified, granted_level, grant) = if let (Some(answer), Some(ticket)) = (answer, ticket) {
         if clearance < 3 {
-            (false, 4)
+            (false, 4, None)
         } else {
-            (crate::vdf::submit(answer, ip, domain.clone()).await.unwrap_or(false), 4)
+            let session = crate::vdf::session_binding(ip, cookie_value(cookie_str, "Arin").unwrap_or(""));
+            let backend_available = crate::state::BACKEND_SEM.with(|sem| sem.borrow().available_permits() > 0);
+            let grant = crate::vdf::submit(&ticket, &answer, ip, session, backend_available, now_secs);
+            (grant.is_some(), 4, grant)
         }
     } else if let (Some(nonce), Some(challenge_secret)) = (nonce, challenge_secret) {
         if clearance < 2 || !verify_pow_ticket(&challenge_secret, ip, &domain, now_secs) {
-            (false, 3)
+            (false, 3, None)
         } else {
             let verified_rx = crate::state::POW_POOL.with(|pool| {
                 pool.borrow().submit(nonce, challenge_secret, POW_DIFFICULTY as usize)
             });
-            (verified_rx.await.unwrap_or(false), 3)
+            (verified_rx.await.unwrap_or(false), 3, None)
         }
     } else {
-        (false, 0)
+        (false, 0, None)
     };
 
     if verified {
-        let cookie_value = create_challenge_cookie_value(ip, now_secs, granted_level);
         let forwarded_proto = parts.headers.get("X-Forwarded-Proto")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("http");
@@ -423,8 +449,12 @@ pub async fn validate_pow(
         } else {
             "; SameSite=Lax"
         };
-        
-        let set_cookie = format!("Arin={}; Path=/; HttpOnly{}", cookie_value, cookie_suffix);
+        let set_cookie = if let Some(grant) = grant {
+            format!("ArinVdf={}; Path=/; Max-Age=10; HttpOnly{}", grant, cookie_suffix)
+        } else {
+            let value = create_challenge_cookie_value(ip, now_secs, granted_level);
+            format!("Arin={}; Path=/; HttpOnly{}", value, cookie_suffix)
+        };
         
         crate::state::DOMAIN_STATS.with(|stats| {
             let mut stats = stats.borrow_mut();
@@ -492,22 +522,30 @@ fn content_length_exceeds<B>(req: &Request<B>, limit: usize) -> bool {
 
 #[inline]
 fn challenge_clearance(cookie_str: &str, ip: IpAddr, now_secs: u64) -> u8 {
-    let arin_value = cookie_str.split(';')
-        .map(|s| s.trim())
-        .find_map(|s| s.strip_prefix("Arin="));
+    let arin_value = cookie_value(cookie_str, "Arin");
     let Some(value) = arin_value else { return 0 };
     let mut parts = value.split(':');
     let Some(level) = parts.next().and_then(|value| value.parse::<u8>().ok()) else { return 0 };
     let Some(timestamp) = parts.next().and_then(|value| value.parse::<u64>().ok()) else { return 0 };
     let Some(hash) = parts.next() else { return 0 };
     if parts.next().is_some()
-        || !(1..=4).contains(&level)
+        || !(1..=3).contains(&level)
         || timestamp > now_secs
         || now_secs.saturating_sub(timestamp) > CHALLENGE_TTL_SECS
     {
         return 0;
     }
     if hash.eq_ignore_ascii_case(&hash_clearance(ip, timestamp, level)) { level } else { 0 }
+}
+
+#[inline]
+fn cookie_value<'a>(cookie_str: &'a str, name: &str) -> Option<&'a str> {
+    cookie_str.split(';')
+        .map(|value| value.trim())
+        .find_map(|value| {
+            let (key, value) = value.split_once('=')?;
+            (key == name).then_some(value)
+        })
 }
 
 #[inline]
@@ -731,10 +769,12 @@ mod tests {
     #[test]
     fn clearance_advances_one_stage_at_a_time() {
         let ip = "192.0.2.1".parse().unwrap();
-        for level in 1..=4 {
+        for level in 1..=3 {
             let value = create_challenge_cookie_value(ip, 100, level);
             assert_eq!(challenge_clearance(&format!("Arin={}", value), ip, 100), level);
         }
+        let value = create_challenge_cookie_value(ip, 100, 4);
+        assert_eq!(challenge_clearance(&format!("Arin={}", value), ip, 100), 0);
         let value = create_challenge_cookie_value(ip, 100, 3);
         assert_eq!(challenge_clearance(&format!("Arin={}", value), "192.0.2.2".parse().unwrap(), 100), 0);
         assert_eq!(challenge_clearance(&format!("Arin={}", value), ip, 401), 0);
