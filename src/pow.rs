@@ -94,8 +94,20 @@ pub fn generate_pow_html(
     challenge_secret: &str,
     difficulty: u32,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let html = include_str!("pow_challenge.html");
-    Ok(html
+    let html = include_str!("pow_challenge.html")
         .replace("{challenge_secret}", challenge_secret)
-        .replace("{difficulty}", &difficulty.to_string()))
+        .replace("{difficulty}", &difficulty.to_string());
+    if html.len() > 2048 { return Err("challenge exceeds 2 KB".into()); }
+    Ok(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_html_stays_under_two_kilobytes() {
+        let challenge = generate_challenge_secret();
+        assert!(generate_pow_html(&challenge, POW_DIFFICULTY).unwrap().len() <= 2048);
+    }
 }
