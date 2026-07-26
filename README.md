@@ -6,15 +6,16 @@ Arin Proxy's primary goal is to cut costs from HTTP/HTTPS DDoS attacks. Ingress 
 
 ## Key Features
 
-* **Blocks Automated Bots:** Being new, Arin Proxy does not yet have specific signatures for AI scrapers, crawlers and other automated bots. This unintentionally provides protection from vexation.
+* **Blocks Automated Bots:** Arin Proxy uses layered browser and automation checks to detect AI scrapers, crawlers, headless browsers and other automated bots. This provides protection from vexation and commodity automation before it reaches your backend.
 
 ## What Does Arin Proxy Do?
 
-Arin Proxy operates through three distinct stages:
+Arin Proxy operates through four distinct stages:
 
 1. **Standard Cookie Challenge:** A simple challenge that sets a cookie in the header.
 2. **JavaScript Challenge:** Ensures the client browser has JavaScript enabled. This blocks a majority of headless browsers.
 3. **Proof of Work (PoW) Challenge:** Creates CPU-intensive tasks that deter attackers by requiring them to solve complex computational hashes. This stage demands significant server resources and operates with multiple workers.
+4. **Private-Verifier VDF Challenge:** Uses sequential RSA repeated squaring for a single-use, request-bound challenge. The work cannot be parallelized within one solve, while the server verifies it cheaply with its private verifier before granting the exact request.
 
 ## Recommendations
 
@@ -32,11 +33,7 @@ This prevents automatic scanners like Shodan or Censys from leaking your backend
 
 ## For Technical Users
 
-After getting multiple DDoS attacks, Cloudflare blocked a total of 435 requests out of 80,740 requests. This is 0.00538766410701%. Arin Proxy can run behind Cloudflare and had to handle all of these requests. All were blocked. 0% of these got through.
-
-<img width="1638" height="514" alt="image" src="https://github.com/user-attachments/assets/91368185-9d52-40fc-85d2-1303f6ac1aa8" />
-
-Arin Proxy effectively eliminates HTTP/HTTPS DDoS attacks when paired with Cloudflare. Only dedicated attacks with large proxy lists and large botnets will be able to take down your website. The stage sensor detects when attacks are getting through or when too many requests are allowed. It will then employ a stricter challenge until the PoW. The PoW is difficullt to take down because attackers need to overwhelm the proxy itself. This would require hundreds of times the amount of compute needed per 1 request that you serve.
+Arin Proxy reduces HTTP/HTTPS DDoS costs when paired with Cloudflare. The stage sensor detects when too many requests are getting through and employs a stricter challenge. The final VDF stage makes successful requests sequential, single-use and request-bound, so dedicated attacks need significant compute as well as large proxy lists and botnets.
 
 **Bandwidth Usage:**
-Our PoW challenge is only **2 KB**. This is way smaller than most other services. We use **JSDelivr** to serve the static challenge assets so your server doesn’t have to. This helps avoid saturating your port. On a **1 Gbps port** you can handle **~45k RPS** just from the PoW stage.
+Our challenge HTML is capped at **2 KB**. This is way smaller than most other services. We use **JSDelivr** to serve the static challenge assets so your server doesn’t have to. This helps avoid saturating your port. On a **1 Gbps port** you can handle **~45k RPS** just from the PoW stage.
