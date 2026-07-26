@@ -163,6 +163,16 @@ mod tests {
         assert_eq!(fixed(&answer.to_bytes_be()), expected);
     }
 
+    #[test]
+    fn challenge_html_stays_under_two_kilobytes() {
+        let challenge = BrowserChallenge {
+            modulus: "f".repeat(WIDTH * 2),
+            base: "e".repeat(WIDTH * 2),
+            difficulty: VDF_DIFFICULTY,
+        };
+        assert!(generate_vdf_html(&challenge).unwrap().len() <= 2048);
+    }
+
     #[tokio::test]
     async fn answer_is_bound_and_single_use() {
         let answer = [173u8; WIDTH];
